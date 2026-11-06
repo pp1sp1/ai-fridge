@@ -284,15 +284,20 @@
         root.addEventListener("click", this._onClick.bind(this));
       }
 
-      /* HA sets `hass` and `config` on custom card elements. */
+      /* HA sets `hass` on custom card elements. */
       set hass(hass) {
         this._hass = hass;
         this._render();
       }
 
-      set config(config) {
+      /* HA calls setConfig(config) to pass card configuration. */
+      setConfig(config) {
         this._config = config || {};
         this._render();
+      }
+
+      getCardSize() {
+        return 3;
       }
 
       connectedCallback() {
