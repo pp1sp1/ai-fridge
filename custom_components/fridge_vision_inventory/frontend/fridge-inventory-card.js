@@ -435,6 +435,12 @@
         const action = button.getAttribute("data-action");
         const id = button.getAttribute("data-id");
 
+        // Nie zamykaj dialogu, gdy kliknięto w elementy wewnątrz (np. input).
+        // Zamknij tylko przy bezpośrednim kliknięciu w tło (backdrop).
+        if (action === "close-dialog" && event.target !== button) {
+          return;
+        }
+
         switch (action) {
           case "inc":
             this._changeQuantity(id, 1);
