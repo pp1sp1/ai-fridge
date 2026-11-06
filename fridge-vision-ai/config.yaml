@@ -1,9 +1,17 @@
 name: "Fridge Vision AI"
 version: "1.0.0"
-slug: fridge_vision_ai
+slug: "fridge_vision_ai"
 description: "YOLO-World v2 computer vision service for smart fridge inventory"
-startup: services
-boot: auto
+startup: "services"
+boot: "auto"
+arch:
+  - aarch64
+  - amd64
+  - armv7
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: "FastAPI REST API"
 homeassistant_api: true
 hassio_api: true
 hassio_role: default

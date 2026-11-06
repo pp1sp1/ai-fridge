@@ -1,4 +1,3 @@
-name: "Fridge Vision Inventory"
+name: "Fridge Vision Inventory Add-ons"
 url: "https://github.com/fridge-vision-inventory/fridge-vision-inventory"
-repository: "https://github.com/fridge-vision-inventory/fridge-vision-inventory"
-icon: "https://github.com/fridge-vision-inventory/fridge-vision-inventory/raw/main/icon.png"
+maintainer: "Fridge Vision Inventory"
