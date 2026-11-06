@@ -8,7 +8,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import selector
 
 from .const import (
     CONF_AI_SERVICE_URL,
@@ -49,25 +49,41 @@ class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(
                         CONF_AI_SERVICE_URL, default="http://local-fridge-vision-ai:8000"
-                    ): str,
-                    vol.Required(CONF_CAMERA_ENTITY): cv.entity_id,
-                    vol.Required(CONF_DOOR_SENSOR_ENTITY): cv.entity_id,
+                    ): selector.TextSelector(),
+                    vol.Required(CONF_CAMERA_ENTITY): selector.EntitySelector(),
+                    vol.Required(CONF_DOOR_SENSOR_ENTITY): selector.EntitySelector(),
                     vol.Optional(
                         CONF_CAPTURE_FPS, default=DEFAULT_CAPTURE_FPS
-                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1, max=30, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
                     vol.Optional(
                         CONF_MOTION_VECTOR_INSERT_DIRECTION,
                         default=DIRECTION_TOP_TO_BOTTOM,
-                    ): vol.In(
-                        {
-                            DIRECTION_TOP_TO_BOTTOM: "Wkładam od góry do dołu (top_to_bottom)",
-                            DIRECTION_BOTTOM_TO_TOP: "Wkładam od dołu do góry (bottom_to_top)",
-                        }
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                selector.SelectOptionDict(
+                                    value=DIRECTION_TOP_TO_BOTTOM,
+                                    label="Wkładam od góry do dołu (top_to_bottom)",
+                                ),
+                                selector.SelectOptionDict(
+                                    value=DIRECTION_BOTTOM_TO_TOP,
+                                    label="Wkładam od dołu do góry (bottom_to_top)",
+                                ),
+                            ]
+                        )
                     ),
                     vol.Optional(
                         CONF_CONFIDENCE_THRESHOLD, default=DEFAULT_CONFIDENCE_THRESHOLD
-                    ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1.0)),
-                    vol.Optional(CONF_NOTIFY_DEVICE): cv.entity_id,
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0.0, max=1.0, step=0.05, mode=selector.NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Optional(CONF_NOTIFY_DEVICE): selector.EntitySelector(),
                 }
             ),
         )
