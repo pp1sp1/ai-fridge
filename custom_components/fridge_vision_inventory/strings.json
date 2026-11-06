@@ -1,0 +1,50 @@
+{
+  "step": {
+    "user": {
+      "title": "Fridge Vision Inventory",
+      "description": "Połącz integrację z add-onem Fridge Vision AI i skonfiguruj wykrywanie produktów w lodówce.",
+      "data": {
+        "ai_service_url": "URL usługi Fridge Vision AI",
+        "camera_entity": "Kamera w lodówce",
+        "door_sensor_entity": "Czujnik kontaktu drzwi lodówki",
+        "capture_fps": "Liczba klatek na sekundę",
+        "motion_vector_insert_direction": "Kierunek wkładania produktów",
+        "confidence_threshold": "Próg pewności detekcji",
+        "notify_device": "Cel powiadomień"
+      },
+      "data_description": {
+        "ai_service_url": "np. http://local-fridge-vision-ai:8000",
+        "camera_entity": "np. camera.esphome_fridge",
+        "door_sensor_entity": "np. binary_sensor.fridge_door_contact",
+        "capture_fps": "Domyślnie 4 klatki na sekundę",
+        "motion_vector_insert_direction": "Kierunek ruchu ręki podczas wkładania produktu do lodówki",
+        "confidence_threshold": "Domyślnie 0.25",
+        "notify_device": "np. notify.mobile_app_telefon"
+      }
+    }
+  },
+  "error": {
+    "single_instance_allowed": "Dozwolona jest tylko jedna instancja tej integracji."
+  },
+  "abort": {
+    "single_instance_allowed": "Dozwolona jest tylko jedna instancja tej integracji."
+  },
+  "service": {
+    "add_item": {
+      "name": "Dodaj produkt",
+      "description": "Dodaje nowy produkt do inwentarza i uruchamia reparametryzację modelu YOLO-World."
+    },
+    "update_quantity": {
+      "name": "Zaktualizuj ilość",
+      "description": "Zmienia ilość produktu o podaną różnicę (delta)."
+    },
+    "delete_item": {
+      "name": "Usuń produkt",
+      "description": "Usuwa produkt z inwentarza i uruchamia reparametryzację modelu YOLO-World."
+    },
+    "reparameterize_model": {
+      "name": "Przetwórz model ponownie",
+      "description": "Wysyła wszystkie aktywne prompty AI do add-onu Fridge Vision AI."
+    }
+  }
+}

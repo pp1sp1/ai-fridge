@@ -1,0 +1,47 @@
+add_item:
+  name: "Dodaj produkt"
+  description: "Dodaje nowy produkt do inwentarza i uruchamia reparametryzację modelu YOLO-World na add-onie."
+  fields:
+    name:
+      name: "Nazwa (PL)"
+      description: "Nazwa wyświetlana produktu w języku polskim, np. Mleko 3.2%"
+      example: "Mleko 3.2%"
+      required: true
+    ai_prompt:
+      name: "Prompt AI (EN)"
+      description: "Angielski opis produktu używany przez model YOLO-World, np. milk carton"
+      example: "milk carton"
+      required: true
+    quantity:
+      name: "Ilość"
+      description: "Początkowa ilość produktu (liczba całkowita >= 0)"
+      example: 1
+      required: false
+    location:
+      name: "Lokalizacja"
+      description: "Lokalizacja produktu, np. fridge"
+      example: "fridge"
+      required: false
+update_quantity:
+  name: "Zaktualizuj ilość"
+  description: "Zmienia ilość produktu o podaną różnicę (delta). Wynik jest ograniczony do >= 0."
+  fields:
+    item_id:
+      name: "Identyfikator produktu"
+      description: "Unikalny identyfikator produktu (UUID)"
+      required: true
+    delta:
+      name: "Różnica"
+      description: "Zmiana ilości, np. 1 lub -1"
+      required: true
+delete_item:
+  name: "Usuń produkt"
+  description: "Usuwa produkt z inwentarza i uruchamia reparametryzację modelu YOLO-World na add-onie."
+  fields:
+    item_id:
+      name: "Identyfikator produktu"
+      description: "Unikalny identyfikator produktu (UUID)"
+      required: true
+reparameterize_model:
+  name: "Przetwórz model ponownie"
+  description: "Zbiera wszystkie unikalne prompty AI z inwentarza i wysyła je do add-onu Fridge Vision AI (/api/set_classes)."
