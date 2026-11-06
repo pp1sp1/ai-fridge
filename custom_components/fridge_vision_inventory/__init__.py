@@ -1,193 +1,236 @@
-"""Fridge Vision Inventory integration for Home Assistant."""
+"""The Fridge Vision Inventory integration.
+
+Auto-registers the bundled Lovelace card as an extra module URL, exposes
+CRUD services and a WebSocket API for the card, and creates one data
+coordinator per config entry.
+"""
 
 from __future__ import annotations
 
 import logging
-import uuid
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.components import websocket_api
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.websocket_api.connection import ActiveConnection
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.util import dt as dt_util
-from homeassistant.helpers.storage import Store
-from homeassistant.components.frontend import add_extra_js_url
-from homeassistant.components.http import StaticPathConfig
 
 from .const import (
-    ACTION_IGNORE,
-    ACTION_INSERT,
-    ACTION_REMOVE,
-    CONF_AI_SERVICE_URL,
-    CONF_CAPTURE_FPS,
-    CONF_CONFIDENCE_THRESHOLD,
-    CONF_CAMERA_ENTITY,
-    CONF_DOOR_SENSOR_ENTITY,
-    CONF_MOTION_VECTOR_INSERT_DIRECTION,
-    CONF_NOTIFY_DEVICE,
-    DEFAULT_CAPTURE_FPS,
-    DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_LOCATION,
     DOMAIN,
-    IMAGE_ENTITY_ID,
     SERVICE_ADD_ITEM,
     SERVICE_DELETE_ITEM,
     SERVICE_REPARAMETERIZE_MODEL,
     SERVICE_UPDATE_QUANTITY,
-    SIGNAL_ITEM_UPDATED,
-    STORAGE_KEY,
-    STORAGE_VERSION,
+    WS_TYPE_ITEMS,
 )
-from .coordinator import FridgeVisionCoordinator
-from .image import FridgeLastDetectionImage
-from .sensor import FridgeInventorySensor
+from .coordinator import FridgeVisionCoordinator, VisionApiError
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.SENSOR, Platform.IMAGE]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.IMAGE]
 
-# Bundled Lovelace card: registered automatically so no manual resources setup.
-CARD_URL_PATH = "/fridge_vision_inventory/fridge-inventory-card.js"
-CARD_FILE_PATH = (
-    "custom_components/fridge_vision_inventory/frontend/fridge-inventory-card.js"
-)
+FRONTEND_URL_PATH = f"/{DOMAIN}/fridge-inventory-card.js"
+FRONTEND_FILE_PATH = f"custom_components/{DOMAIN}/frontend/fridge-inventory-card.js"
+
+_DATA_FRONTEND_REGISTERED = f"{DOMAIN}_frontend_registered"
+_DATA_SERVICES_REGISTERED = f"{DOMAIN}_services_registered"
+_DATA_WS_REGISTERED = f"{DOMAIN}_ws_registered"
+
+SERVICE_SCHEMAS: dict[str, vol.Schema] = {
+    SERVICE_ADD_ITEM: vol.Schema(
+        {
+            vol.Required("name"): cv.string,
+            vol.Required("ai_prompt"): cv.string,
+            vol.Optional("quantity", default=1): vol.All(
+                vol.Coerce(int), vol.Range(min=0, max=9999)
+            ),
+            vol.Optional("location", default=DEFAULT_LOCATION): cv.string,
+        }
+    ),
+    SERVICE_UPDATE_QUANTITY: vol.Schema(
+        {
+            vol.Required("item_id"): cv.string,
+            vol.Required("delta"): vol.All(
+                vol.Coerce(int), vol.Range(min=-999, max=999)
+            ),
+        }
+    ),
+    SERVICE_DELETE_ITEM: vol.Schema({vol.Required("item_id"): cv.string}),
+    SERVICE_REPARAMETERIZE_MODEL: vol.Schema({}),
+}
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
-    """Set up the integration and auto-register the Lovelace card."""
-    hass.data.setdefault(DOMAIN, {})
-
-    file_path = hass.config.path(CARD_FILE_PATH)
-    await hass.http.async_register_static_paths(
-        [StaticPathConfig(CARD_URL_PATH, file_path, cache_headers=False)]
-    )
-    add_extra_js_url(hass, CARD_URL_PATH)
-
+    """Set up the integration (config-flow only; nothing to do here)."""
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a config entry."""
-    store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-    stored = await store.async_load() or {}
-    items: list[dict[str, Any]] = stored.get("items", [])
+async def _async_register_frontend(hass: HomeAssistant) -> None:
+    """Serve the bundled card and inject it into every Lovelace dashboard."""
+    if hass.data.get(_DATA_FRONTEND_REGISTERED):
+        return
+    file_path = Path(hass.config.path(FRONTEND_FILE_PATH))
+    if not file_path.is_file():
+        _LOGGER.error(
+            "Bundled card not found at %s; frontend registration skipped",
+            file_path,
+        )
+        return
+    await hass.http.async_register_static_paths(
+        [StaticPathConfig(FRONTEND_URL_PATH, str(file_path), cache_headers=False)]
+    )
+    add_extra_js_url(hass, FRONTEND_URL_PATH)
+    hass.data[_DATA_FRONTEND_REGISTERED] = True
+    _LOGGER.debug("Lovelace card registered at %s", FRONTEND_URL_PATH)
 
-    coordinator = FridgeVisionCoordinator(hass, entry, store, items)
-    await coordinator.async_setup()
 
-    domain_data: dict[str, Any] = {
-        "coordinator": coordinator,
-        "items": items,
-        "add_entities": None,
-        "image_entity": None,
-        "sensors": {},
-    }
-    hass.data[DOMAIN][entry.entry_id] = domain_data
+def _get_coordinator(hass: HomeAssistant) -> FridgeVisionCoordinator | None:
+    """Return the (single) coordinator, if any entry is set up."""
+    for value in hass.data.get(DOMAIN, {}).values():
+        if isinstance(value, FridgeVisionCoordinator):
+            return value
+    return None
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    async def async_add_item(call: ServiceCall) -> None:
-        name: str = call.data["name"]
-        ai_prompt: str = call.data["ai_prompt"]
-        quantity: int = max(0, int(call.data.get("quantity", 1)))
-        location: str = call.data.get("location", DEFAULT_LOCATION)
-        item: dict[str, Any] = {
-            "id": str(uuid.uuid4()),
-            "name": name,
-            "ai_prompt": ai_prompt,
-            "quantity": quantity,
-            "location": location,
-            "last_updated": dt_util.utcnow().isoformat(),
-        }
-        items.append(item)
-        await coordinator.async_save()
-        await coordinator.async_reparameterize_model()
-        add_entities = domain_data["add_entities"]
-        if add_entities is not None:
-            sensor = FridgeInventorySensor(coordinator, item)
-            add_entities([sensor])
-            domain_data["sensors"][item["id"]] = sensor
+def _require_coordinator(hass: HomeAssistant) -> FridgeVisionCoordinator:
+    coordinator = _get_coordinator(hass)
+    if coordinator is None:
+        raise HomeAssistantError("Fridge Vision Inventory is not set up")
+    return coordinator
 
-    async def async_update_quantity(call: ServiceCall) -> None:
-        item_id: str = call.data["item_id"]
-        delta: int = int(call.data["delta"])
-        item = coordinator.find_item(item_id)
-        if item is None:
-            return
-        item["quantity"] = max(0, int(item.get("quantity", 0)) + delta)
-        item["last_updated"] = dt_util.utcnow().isoformat()
-        await coordinator.async_save()
-        async_dispatcher_send(hass, SIGNAL_ITEM_UPDATED.format(item_id), item)
 
-    async def async_delete_item(call: ServiceCall) -> None:
-        item_id: str = call.data["item_id"]
-        item = coordinator.find_item(item_id)
-        if item is None:
-            return
-        items[:] = [existing for existing in items if existing.get("id") != item_id]
-        sensor = domain_data["sensors"].pop(item_id, None)
-        if sensor is not None:
-            await sensor.async_remove(force_remove=True)
-        await coordinator.async_save()
-        await coordinator.async_reparameterize_model()
+@callback
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register the domain services once."""
+    if hass.data.get(_DATA_SERVICES_REGISTERED):
+        return
+    hass.data[_DATA_SERVICES_REGISTERED] = True
 
-    async def async_reparameterize_model(call: ServiceCall) -> None:
-        await coordinator.async_reparameterize_model()
+    async def _async_handle_add_item(call: ServiceCall) -> None:
+        await _require_coordinator(hass).async_add_item(
+            name=call.data["name"],
+            ai_prompt=call.data["ai_prompt"],
+            quantity=call.data["quantity"],
+            location=call.data["location"],
+        )
+
+    async def _async_handle_update_quantity(call: ServiceCall) -> None:
+        await _require_coordinator(hass).async_update_quantity(
+            call.data["item_id"], call.data["delta"]
+        )
+
+    async def _async_handle_delete_item(call: ServiceCall) -> None:
+        await _require_coordinator(hass).async_delete_item(call.data["item_id"])
+
+    async def _async_handle_reparameterize(call: ServiceCall) -> None:
+        coordinator = _require_coordinator(hass)
+        try:
+            ok = await coordinator.async_reparameterize_model()
+        except VisionApiError as err:
+            raise HomeAssistantError(
+                f"Re-parameterization failed: {err}"
+            ) from err
+        if not ok:
+            raise HomeAssistantError(
+                "No AI prompts configured; add an inventory item first"
+            )
 
     hass.services.async_register(
         DOMAIN,
         SERVICE_ADD_ITEM,
-        async_add_item,
-        schema=vol.Schema(
-            {
-                vol.Required("name"): cv.string,
-                vol.Required("ai_prompt"): cv.string,
-                vol.Optional("quantity", default=1): vol.All(
-                    vol.Coerce(int), vol.Range(min=0)
-                ),
-                vol.Optional("location", default=DEFAULT_LOCATION): cv.string,
-            }
-        ),
+        _async_handle_add_item,
+        schema=SERVICE_SCHEMAS[SERVICE_ADD_ITEM],
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_UPDATE_QUANTITY,
-        async_update_quantity,
-        schema=vol.Schema(
-            {
-                vol.Required("item_id"): cv.string,
-                vol.Required("delta"): vol.Coerce(int),
-            }
-        ),
+        _async_handle_update_quantity,
+        schema=SERVICE_SCHEMAS[SERVICE_UPDATE_QUANTITY],
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_DELETE_ITEM,
-        async_delete_item,
-        schema=vol.Schema({vol.Required("item_id"): cv.string}),
+        _async_handle_delete_item,
+        schema=SERVICE_SCHEMAS[SERVICE_DELETE_ITEM],
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_REPARAMETERIZE_MODEL,
-        async_reparameterize_model,
+        _async_handle_reparameterize,
+        schema=SERVICE_SCHEMAS[SERVICE_REPARAMETERIZE_MODEL],
     )
+    _LOGGER.debug("Domain services registered")
 
+
+@callback
+def _async_register_websocket_api(hass: HomeAssistant) -> None:
+    """Register the WebSocket command used by the bundled card."""
+    if hass.data.get(_DATA_WS_REGISTERED):
+        return
+    hass.data[_DATA_WS_REGISTERED] = True
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_ITEMS})
+    @callback
+    def ws_get_items(
+        hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        coordinator = _get_coordinator(hass)
+        if coordinator is None:
+            connection.send_error(
+                msg["id"], "not_ready", "Fridge Vision Inventory is not set up"
+            )
+            return
+        connection.send_result(
+            msg["id"],
+            {"items": [item.to_dict() for item in coordinator.sorted_items()]},
+        )
+
+    websocket_api.async_register_command(hass, ws_get_items)
+    _LOGGER.debug("WebSocket API registered (%s)", WS_TYPE_ITEMS)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Fridge Vision Inventory from a config entry."""
+    await _async_register_frontend(hass)
+
+    coordinator = FridgeVisionCoordinator(hass, entry)
+    await coordinator.async_setup()
+    entry.runtime_data = coordinator
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    _async_register_services(hass)
+    _async_register_websocket_api(hass)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    domain_data = hass.data[DOMAIN].get(entry.entry_id)
-    if domain_data is not None:
-        coordinator: FridgeVisionCoordinator = domain_data.get("coordinator")
-        if coordinator is not None:
-            await coordinator.async_unload()
-
+    """Unload a config entry and shut its coordinator down."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-    return unload_ok
+    if not unload_ok:
+        return False
+
+    coordinator = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    if isinstance(coordinator, FridgeVisionCoordinator):
+        await coordinator.async_shutdown()
+
+    if not hass.data.get(DOMAIN):
+        for service in (
+            SERVICE_ADD_ITEM,
+            SERVICE_UPDATE_QUANTITY,
+            SERVICE_DELETE_ITEM,
+            SERVICE_REPARAMETERIZE_MODEL,
+        ):
+            hass.services.async_remove(DOMAIN, service)
+        hass.data.pop(_DATA_SERVICES_REGISTERED, None)
+    return True

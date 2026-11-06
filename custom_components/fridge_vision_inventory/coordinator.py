@@ -1,345 +1,741 @@
-"""Coordinator for the door-open frame capture and analysis cycle."""
+"""Data coordinator for Fridge Vision Inventory.
+
+Responsibilities:
+* persist and mutate the inventory (``Store``-backed),
+* grab camera frames at ~4 FPS while the door is open (max 30 s buffer),
+* post the buffered sequence to the Vision AI add-on on door close,
+* apply INSERTED / REMOVED actions to item quantities,
+* dispatch actionable notifications for ambiguous movements,
+* re-parameterize the add-on model whenever items change.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import json
 import logging
-from pathlib import Path
-from typing import Any
+import time
 import uuid
+from typing import Any, Callable
 
-import async_timeout
+import aiohttp
 
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import aiohttp_client
+from homeassistant.components import camera
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
+from homeassistant.core import Event, HomeAssistant, State, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
     ACTION_IGNORE,
     ACTION_INSERT,
     ACTION_REMOVE,
+    ANALYZE_TIMEOUT,
+    BUFFER_SECONDS,
+    CAPTURE_SNAPSHOT_TIMEOUT,
     CONF_AI_SERVICE_URL,
+    CONF_CAMERA_ENTITY,
     CONF_CAPTURE_FPS,
     CONF_CONFIDENCE_THRESHOLD,
-    CONF_CAMERA_ENTITY,
     CONF_DOOR_SENSOR_ENTITY,
     CONF_MOTION_VECTOR_INSERT_DIRECTION,
     CONF_NOTIFY_DEVICE,
     DEFAULT_CAPTURE_FPS,
     DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_LOCATION,
+    DETECTION_AMBIGUOUS,
+    DETECTION_INSERTED,
+    DETECTION_REMOVED,
     DOMAIN,
-    MAX_CAPTURE_SECONDS,
-    ANALYSIS_TIMEOUT_SECONDS,
-    REPARAMETERIZE_TIMEOUT_SECONDS,
-    NOTIFICATION_MESSAGE,
-    NOTIFICATION_TITLE,
-    SIGNAL_ITEM_UPDATED,
+    EVENT_NOTIFICATION_ACTION,
+    HEALTH_TIMEOUT,
+    MAX_BUFFERED_FRAMES,
+    MIN_FRAMES_FOR_ANALYSIS,
+    NOTIFY_DOMAIN,
+    NOTIFICATION_TITLE_AMBIGUOUS,
+    NOTIFICATION_TITLE_UNKNOWN_ITEM,
+    PENDING_LIFETIME_MINUTES,
+    SAVE_DELAY,
+    SET_CLASSES_TIMEOUT,
+    SIGNAL_ITEMS_UPDATED,
+    STORAGE_KEY,
+    STORAGE_VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-SNAPSHOT_PREFIX = "fridge_vision_"
-EVENT_NOTIFICATION_ACTION = "mobile_app_notification_action"
+
+@dataclass(slots=True)
+class InventoryItem:
+    """A single inventory entry persisted in the Store."""
+
+    id: str
+    name: str
+    ai_prompt: str
+    quantity: int
+    location: str
+    last_updated: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for storage and WebSocket responses."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "ai_prompt": self.ai_prompt,
+            "quantity": self.quantity,
+            "location": self.location,
+            "last_updated": self.last_updated,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> InventoryItem | None:
+        """Deserialize one stored entry; returns None when malformed."""
+        try:
+            item_id = str(payload["id"]).strip()
+            name = str(payload["name"]).strip()
+            ai_prompt = str(payload["ai_prompt"]).strip()
+            if not item_id or not name or not ai_prompt:
+                return None
+            quantity = max(0, int(payload.get("quantity", 0)))
+            location = str(payload.get("location") or DEFAULT_LOCATION)
+            last_updated = str(
+                payload.get("last_updated") or dt_util.utcnow().isoformat()
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        return cls(
+            id=item_id,
+            name=name,
+            ai_prompt=ai_prompt,
+            quantity=quantity,
+            location=location,
+            last_updated=last_updated,
+        )
+
+
+class InventoryStore:
+    """Store-backed persistence for inventory items."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+
+    async def async_load(self) -> dict[str, InventoryItem]:
+        """Load all items from storage."""
+        raw = await self._store.async_load()
+        items: dict[str, InventoryItem] = {}
+        if not raw or not isinstance(raw.get("items"), dict):
+            return items
+        for key, payload in raw["items"].items():
+            item = InventoryItem.from_dict(payload)
+            if item is None:
+                _LOGGER.warning("Skipping malformed inventory entry %s", key)
+                continue
+            items[item.id] = item
+        return items
+
+    def async_delay_save(self, items: dict[str, InventoryItem]) -> None:
+        """Schedule a debounced save of the current item map."""
+        self._store.async_delay_save(
+            lambda: {
+                item_id: item.to_dict() for item_id, item in items.items()
+            },
+            SAVE_DELAY,
+        )
+
+    async def async_save(self, items: dict[str, InventoryItem]) -> None:
+        """Save the item map immediately (used on shutdown)."""
+        await self._store.async_save(
+            {item_id: item.to_dict() for item_id, item in items.items()}
+        )
+
+
+class VisionApiError(HomeAssistantError):
+    """Raised when the Vision AI add-on cannot be reached or fails."""
+
+
+class VisionApiClient:
+    """Small aiohttp client for the Vision AI add-on REST API."""
+
+    def __init__(self, session: aiohttp.ClientSession, base_url: str) -> None:
+        self._session = session
+        self._base_url = base_url.rstrip("/")
+
+    @property
+    def base_url(self) -> str:
+        """Base URL of the add-on API."""
+        return self._base_url
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout: float = HEALTH_TIMEOUT,
+    ) -> dict[str, Any]:
+        url = f"{self._base_url}{path}"
+        try:
+            async with self._session.request(
+                method,
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise VisionApiError(
+                        f"{method} {url} failed with HTTP {response.status}: "
+                        f"{body[:200]}"
+                    )
+        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+            raise VisionApiError(f"{method} {url} failed: {err}") from err
+        if not body:
+            return {}
+        try:
+            return json.loads(body)
+        except ValueError as err:
+            raise VisionApiError(
+                f"{method} {url} returned a non-JSON response: {body[:200]}"
+            ) from err
+
+    async def async_health(self, timeout: float = HEALTH_TIMEOUT) -> dict[str, Any]:
+        """Probe the add-on health endpoint."""
+        return await self._request("GET", "/api/health", timeout=timeout)
+
+    async def async_set_classes(
+        self, classes: list[str], timeout: float = SET_CLASSES_TIMEOUT
+    ) -> dict[str, Any]:
+        """Push zero-shot prompts to the model."""
+        return await self._request(
+            "POST", "/api/set_classes", {"classes": classes}, timeout=timeout
+        )
+
+    async def async_analyze(
+        self,
+        frames: list[str],
+        vector_direction: str,
+        confidence_threshold: float,
+        timeout: float = ANALYZE_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Analyze a buffered door-open sequence."""
+        return await self._request(
+            "POST",
+            "/api/analyze_sequence",
+            {
+                "frames": frames,
+                "vector_direction": vector_direction,
+                "confidence_threshold": confidence_threshold,
+            },
+            timeout=timeout,
+        )
+
+
+def device_info(entry_id: str) -> DeviceInfo:
+    """Device that all integration entities attach to."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry_id)},
+        name="Fridge Vision Inventory",
+        manufacturer="Fridge Vision",
+        model="Fridge Vision AI (YOLO-World v2)",
+    )
+
+
+def _extract_snapshot_bytes(snapshot: Any) -> bytes | None:
+    """Support both the historic bytes return and the newer Image dataclass."""
+    if snapshot is None:
+        return None
+    if isinstance(snapshot, (bytes, bytearray)):
+        return bytes(snapshot)
+    content = getattr(snapshot, "content", None)
+    return bytes(content) if content else None
 
 
 class FridgeVisionCoordinator:
-    """Owns the door-open detection cycle for a single config entry."""
+    """Runtime coordinator bound to a config entry."""
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        entry: Any,
-        store: Any,
-        items: list[dict[str, Any]],
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
-        self.store = store
-        self.items = items
-        self._session = aiohttp_client.async_get_clientsession(hass)
+        self.items: dict[str, InventoryItem] = {}
+        self._store = InventoryStore(hass)
+        self._client = VisionApiClient(
+            async_get_clientsession(hass), str(entry.data[CONF_AI_SERVICE_URL])
+        )
+        self._buffer: deque[tuple[datetime, bytes]] = deque()
         self._capture_task: asyncio.Task | None = None
-        self._stop_event = asyncio.Event()
-        self._unsub_door = None
-        self._unsub_notification = None
-        self._door_open = False
-        self._buffer: list[str] = []
-        self._pending: dict[str, dict[str, Any]] = {}
-
-    @property
-    def ai_service_url(self) -> str:
-        return self.entry.data[CONF_AI_SERVICE_URL]
+        self._analysis_task: asyncio.Task | None = None
+        self._background_tasks: list[asyncio.Task] = []
+        self._pending_ambiguous: dict[str, dict[str, Any]] = {}
+        self._image_entity: Any | None = None
+        self._unsubs: list[Callable[[], None]] = []
+        self._dirty = False
 
     async def async_setup(self) -> None:
-        """Listen to the door sensor and notification action events."""
-        door_entity = self.entry.data[CONF_DOOR_SENSOR_ENTITY]
-        self._unsub_door = async_track_state_change_event(
-            self.hass, [door_entity], self._async_door_changed
-        )
-        initial_state = self.hass.states.get(door_entity)
-        self._door_open = (
-            initial_state is not None and initial_state.state == "on"
-        )
-        self._unsub_notification = self.hass.bus.async_listen(
-            EVENT_NOTIFICATION_ACTION, self._async_notification_action
-        )
+        """Load stored items and subscribe to door + notification events."""
+        self.items = await self._store.async_load()
+        _LOGGER.info("Loaded %d inventory item(s)", len(self.items))
 
-    async def async_unload(self) -> None:
-        """Unsubscribe listeners and stop any in-progress capture."""
-        if self._unsub_door is not None:
-            self._unsub_door()
-            self._unsub_door = None
-        if self._unsub_notification is not None:
-            self._unsub_notification()
-            self._unsub_notification = None
-        self._stop_event.set()
-        if self._capture_task is not None:
-            try:
-                await self._capture_task
-            except asyncio.CancelledError:
-                pass
-            self._capture_task = None
+        self._unsubs.append(
+            async_track_state_change_event(
+                self.hass,
+                [self.entry.data[CONF_DOOR_SENSOR_ENTITY]],
+                self._handle_door_event,
+            )
+        )
+        self._unsubs.append(
+            self.hass.bus.async_listen(
+                EVENT_NOTIFICATION_ACTION, self._handle_notification_action
+            )
+        )
+        if self.items:
+            self._schedule_reparameterize()
 
     @callback
-    def _async_door_changed(self, event: Any) -> None:
-        new_state = event.data.get("new_state")
-        if new_state is None:
+    def _handle_door_event(self, event: Event) -> None:
+        """Start capture on door-open, analyze on door-close."""
+        new_state: State | None = event.data.get("new_state")
+        old_state: State | None = event.data.get("old_state")
+        if new_state is None or new_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             return
-        is_open = new_state.state == "on"
-        if is_open and not self._door_open:
-            self.hass.async_create_task(self._async_door_opened())
-        elif not is_open and self._door_open:
-            self.hass.async_create_task(self._async_door_closed())
-        self._door_open = is_open
-
-    async def _async_door_opened(self) -> None:
-        self._buffer = []
-        self._stop_event.clear()
-        self._capture_task = asyncio.create_task(self._async_capture_loop())
-
-    async def _async_door_closed(self) -> None:
-        self._stop_event.set()
-        task = self._capture_task
-        self._capture_task = None
-        if task is not None:
-            await task
-        await self._async_process_buffer()
+        if new_state.state == STATE_ON and (
+            old_state is None or old_state.state != STATE_ON
+        ):
+            _LOGGER.debug("Door opened - starting frame capture")
+            self._buffer.clear()
+            if self._capture_task is None or self._capture_task.done():
+                self._capture_task = self.hass.async_create_task(
+                    self._async_capture_loop()
+                )
+        elif new_state.state == STATE_OFF and (
+            old_state is None or old_state.state != STATE_OFF
+        ):
+            _LOGGER.debug("Door closed - stopping capture and analyzing")
+            if self._capture_task is not None:
+                self._capture_task.cancel()
+                self._capture_task = None
+            self._analysis_task = self.hass.async_create_task(
+                self._async_process_door_close()
+            )
 
     async def _async_capture_loop(self) -> None:
-        """Capture camera frames at the configured FPS while the door is open."""
-        fps = self.entry.data.get(CONF_CAPTURE_FPS, DEFAULT_CAPTURE_FPS)
-        interval = max(0.1, 1.0 / float(fps))
-        deadline = asyncio.get_running_loop().time() + MAX_CAPTURE_SECONDS
-        camera_entity = self.entry.data[CONF_CAMERA_ENTITY]
-
-        while not self._stop_event.is_set():
-            if asyncio.get_running_loop().time() > deadline:
-                break
-            try:
-                frame = await self._async_snapshot_frame(camera_entity)
-            except Exception as err:  # network timeouts / dropped frames
-                _LOGGER.warning(
-                    "Failed to capture frame from %s: %s", camera_entity, err
-                )
-                await asyncio.sleep(interval)
-                continue
-            if frame is not None:
-                self._buffer.append(frame)
-            await asyncio.sleep(interval)
-
-    async def _async_snapshot_frame(self, camera_entity: str) -> str | None:
-        """Capture a single camera snapshot and return it as base64 JPEG."""
-        snapshot_name = f"{SNAPSHOT_PREFIX}{uuid.uuid4().hex}.jpg"
-        snapshot_path = Path(self.hass.config.config_dir) / snapshot_name
+        """Grab frames from the camera at the configured FPS until cancelled."""
+        fps = int(self.entry.data.get(CONF_CAPTURE_FPS, DEFAULT_CAPTURE_FPS))
+        interval = 1.0 / max(1, fps)
         try:
-            await self.hass.services.async_call(
-                "camera",
-                "snapshot",
-                {"entity_id": camera_entity, "filename": str(snapshot_path)},
-                blocking=True,
-            )
-            data = await self.hass.async_add_executor_job(
-                snapshot_path.read_bytes
-            )
-            return base64.b64encode(data).decode("ascii")
-        finally:
-            await self.hass.async_add_executor_job(
-                lambda: snapshot_path.unlink(missing_ok=True)
-            )
+            while True:
+                started = time.monotonic()
+                try:
+                    snapshot = await camera.async_get_image(
+                        self.hass,
+                        self.entry.data[CONF_CAMERA_ENTITY],
+                        timeout=CAPTURE_SNAPSHOT_TIMEOUT,
+                    )
+                except (HomeAssistantError, asyncio.TimeoutError, aiohttp.ClientError) as err:
+                    _LOGGER.debug("Frame grab failed: %s", err)
+                else:
+                    data = _extract_snapshot_bytes(snapshot)
+                    if data:
+                        self._buffer.append((dt_util.utcnow(), data))
+                        self._trim_buffer()
+                elapsed = time.monotonic() - started
+                await asyncio.sleep(max(0.02, interval - elapsed))
+        except asyncio.CancelledError:
+            _LOGGER.debug("Frame capture cancelled")
+            raise
 
-    async def _async_process_buffer(self) -> None:
-        """Send buffered frames to the add-on and apply the analysis result."""
-        frames = self._buffer
-        self._buffer = []
-        if not frames:
+    def _trim_buffer(self) -> None:
+        """Keep at most BUFFER_SECONDS worth of frames (FIFO)."""
+        cutoff = dt_util.utcnow() - timedelta(seconds=BUFFER_SECONDS)
+        while self._buffer and self._buffer[0][0] < cutoff:
+            self._buffer.popleft()
+        while len(self._buffer) > MAX_BUFFERED_FRAMES:
+            self._buffer.popleft()
+
+    async def _async_process_door_close(self) -> None:
+        """Send the buffered frames to the add-on and apply the result."""
+        buffer = list(self._buffer)
+        self._buffer.clear()
+        if len(buffer) < MIN_FRAMES_FOR_ANALYSIS:
+            _LOGGER.info(
+                "Door closed but fewer than %d frames captured; skipping analysis",
+                MIN_FRAMES_FOR_ANALYSIS,
+            )
             return
-
-        direction = self.entry.data.get(
-            CONF_MOTION_VECTOR_INSERT_DIRECTION,
-            "top_to_bottom",
-        )
-        threshold = float(
-            self.entry.data.get(CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD)
-        )
-
+        frames_b64 = [base64.b64encode(data).decode("ascii") for _, data in buffer]
+        _LOGGER.info("Analyzing door sequence with %d frame(s)", len(frames_b64))
         try:
-            async with async_timeout.timeout(ANALYSIS_TIMEOUT_SECONDS):
-                response = await self._session.post(
-                    f"{self.ai_service_url}/api/analyze_sequence",
-                    json={
-                        "frames": frames,
-                        "vector_direction": direction,
-                        "confidence_threshold": threshold,
-                    },
-                )
-                response.raise_for_status()
-                result = await response.json()
-        except Exception as err:
-            _LOGGER.error("Analysis request to %s failed: %s", self.ai_service_url, err)
+            result = await self._client.async_analyze(
+                frames_b64,
+                str(self.entry.data[CONF_MOTION_VECTOR_INSERT_DIRECTION]),
+                float(
+                    self.entry.data.get(
+                        CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD
+                    )
+                ),
+            )
+        except VisionApiError as err:
+            _LOGGER.error("Vision AI analysis failed: %s", err)
+            await self._async_report_analysis_error(str(err))
             return
+        await self._async_apply_analysis(result)
 
-        # Show the last annotated frame in the image entity.
+    async def _async_apply_analysis(self, result: dict[str, Any]) -> None:
+        """Update the image entity and item quantities from the analysis."""
         annotated_b64 = result.get("annotated_image_base64")
-        if annotated_b64:
-            try:
-                image_bytes = base64.b64decode(annotated_b64)
-            except Exception:
-                image_bytes = None
-            if image_bytes:
-                domain_data = self.hass.data[DOMAIN].get(self.entry.entry_id, {})
-                image_entity = domain_data.get("image_entity")
-                if image_entity is not None:
-                    image_entity.async_set_image(image_bytes)
-
-        changed_items: list[dict[str, Any]] = []
-        for detection in result.get("detections", []):
-            action = detection.get("action")
-            confidence = float(detection.get("confidence", 0.0))
-            prompt = detection.get("ai_prompt")
-            if not prompt:
-                continue
-            item = self.find_item_by_prompt(prompt)
-
-            if action == ACTION_INSERT and confidence >= threshold and item is not None:
-                item["quantity"] = int(item.get("quantity", 0)) + 1
-                item["last_updated"] = dt_util.utcnow().isoformat()
-                changed_items.append(item)
-            elif (
-                action == ACTION_REMOVE
-                and confidence >= threshold
-                and item is not None
-            ):
-                item["quantity"] = max(0, int(item.get("quantity", 0)) - 1)
-                item["last_updated"] = dt_util.utcnow().isoformat()
-                changed_items.append(item)
-            elif action == "AMBIGUOUS":
-                self._async_dispatch_ambiguous(item, prompt)
-
-        if changed_items:
-            await self.async_save()
-            for item in changed_items:
-                async_dispatcher_send(
-                    self.hass,
-                    SIGNAL_ITEM_UPDATED.format(item["id"]),
-                    item,
+        if annotated_b64 and self._image_entity is not None:
+            with suppress(binascii.Error, ValueError):
+                self._image_entity.async_set_detection_image(
+                    base64.b64decode(annotated_b64)
                 )
 
-    def _async_dispatch_ambiguous(
-        self, item: dict[str, Any] | None, prompt: str
-    ) -> None:
-        """Fire an actionable notification for an ambiguous detection."""
-        notify_device = self.entry.data.get(CONF_NOTIFY_DEVICE)
-        if not notify_device:
-            _LOGGER.debug(
-                "Ambiguous detection for %s but no notify device configured", prompt
-            )
-            return
-
-        item_name = item["name"] if item is not None else prompt
-        notification_id = f"fridge_vision_ambiguous_{uuid.uuid4().hex}"
-        self._pending[notification_id] = {
-            "item_id": item["id"] if item is not None else None,
-            "item_name": item_name,
-        }
-
-        message = NOTIFICATION_MESSAGE.format(item_name=item_name)
-        data = {
-            "notification_id": notification_id,
-            "actions": [
-                {"action": ACTION_INSERT, "title": "Włożyłem"},
-                {"action": ACTION_REMOVE, "title": "Wyjąłem"},
-                {"action": ACTION_IGNORE, "title": "Ignoruj"},
-            ],
-        }
-        self.hass.async_create_task(
-            self.hass.services.async_call(
-                "notify",
-                notify_device,
-                {"title": NOTIFICATION_TITLE, "message": message, "data": data},
+        threshold = float(
+            self.entry.data.get(
+                CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD
             )
         )
+        changed = False
+        for detection in result.get("detections", []):
+            action = str(detection.get("action", ""))
+            prompt = str(detection.get("ai_prompt", "")).strip()
+            try:
+                confidence = float(detection.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence < threshold:
+                _LOGGER.debug(
+                    "Ignoring detection %r below confidence threshold", prompt
+                )
+                continue
+            item = self._find_item_by_prompt(prompt)
+            if action == DETECTION_INSERTED:
+                if item is None:
+                    await self._async_notify_unknown_item(prompt, action)
+                else:
+                    item.quantity += 1
+                    self._touch(item)
+                    changed = True
+                    _LOGGER.info(
+                        "Inserted %s -> quantity %d", item.name, item.quantity
+                    )
+            elif action == DETECTION_REMOVED:
+                if item is None:
+                    await self._async_notify_unknown_item(prompt, action)
+                else:
+                    item.quantity = max(0, item.quantity - 1)
+                    self._touch(item)
+                    changed = True
+                    _LOGGER.info(
+                        "Removed %s -> quantity %d", item.name, item.quantity
+                    )
+            elif action == DETECTION_AMBIGUOUS:
+                await self._async_notify_ambiguous(item, prompt)
+            else:
+                _LOGGER.debug("Ignoring unknown action %r", action)
+        if changed:
+            await self._async_schedule_save()
+            self._async_signal_items_updated()
 
-    async def _async_notification_action(self, event: Any) -> None:
-        """Handle mobile_app_notification_action events."""
-        data = event.data or {}
+    @callback
+    def _handle_notification_action(self, event: Event) -> None:
+        """React to taps on the actionable notification buttons."""
+        data = event.data
         action = data.get("action")
-        notification_id = data.get("notification_id")
         if action not in (ACTION_INSERT, ACTION_REMOVE, ACTION_IGNORE):
             return
-        pending = self._pending.pop(notification_id, None)
-        if pending is None:
-            return
-        item_id = pending.get("item_id")
-        if action == ACTION_IGNORE or item_id is None:
-            return
-        item = self.find_item(item_id)
-        if item is None:
-            return
-        delta = 1 if action == ACTION_INSERT else -1
-        item["quantity"] = max(0, int(item.get("quantity", 0)) + delta)
-        item["last_updated"] = dt_util.utcnow().isoformat()
-        await self.async_save()
-        async_dispatcher_send(
-            self.hass, SIGNAL_ITEM_UPDATED.format(item_id), item
+        self.hass.async_create_task(
+            self._async_handle_notification_action(str(action), dict(data))
         )
 
-    def find_item(self, item_id: str) -> dict[str, Any] | None:
-        for item in self.items:
-            if item.get("id") == item_id:
-                return item
-        return None
+    async def _async_handle_notification_action(
+        self, action: str, data: dict[str, Any]
+    ) -> None:
+        """Apply the chosen action to the pending ambiguous detection."""
+        self._prune_pending()
+        tag = str(data.get("tag") or "")
+        pending = self._pending_ambiguous.pop(tag, None) if tag else None
+        item_id = data.get("item_id") or (pending or {}).get("item_id")
+        if action == ACTION_IGNORE:
+            _LOGGER.debug("Ambiguous detection ignored via notification")
+            return
+        if not item_id or str(item_id) not in self.items:
+            _LOGGER.warning(
+                "Notification action %s without a resolvable item", action
+            )
+            return
+        delta = 1 if action == ACTION_INSERT else -1
+        try:
+            await self.async_update_quantity(str(item_id), delta)
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "Could not apply notification action %s: %s", action, err
+            )
 
-    def find_item_by_prompt(self, prompt: str) -> dict[str, Any] | None:
-        for item in self.items:
-            if item.get("ai_prompt", "").lower() == prompt.lower():
-                return item
-        return None
+    def _prune_pending(self) -> None:
+        """Drop stale pending ambiguous detections."""
+        now = dt_util.utcnow()
+        expired = [
+            tag
+            for tag, payload in self._pending_ambiguous.items()
+            if payload["expires"] < now
+        ]
+        for tag in expired:
+            self._pending_ambiguous.pop(tag, None)
 
-    async def async_save(self) -> None:
-        """Persist the inventory to HA storage."""
-        await self.store.async_save({"items": self.items})
+    def _touch(self, item: InventoryItem) -> None:
+        item.last_updated = dt_util.utcnow().isoformat()
 
-    async def async_reparameterize_model(self) -> None:
-        """Send all unique inventory prompts to the add-on (/api/set_classes)."""
+    async def _async_schedule_save(self) -> None:
+        self._dirty = True
+        self._store.async_delay_save(self.items)
+
+    @callback
+    def _async_signal_items_updated(self) -> None:
+        async_dispatcher_send(self.hass, SIGNAL_ITEMS_UPDATED)
+
+    async def _async_notify(
+        self,
+        title: str,
+        message: str,
+        actions: list[dict[str, Any]] | None = None,
+        tag: str | None = None,
+    ) -> None:
+        """Send a (optionally actionable) notification to the configured target."""
+        target = str(self.entry.data.get(CONF_NOTIFY_DEVICE, "") or "").strip()
+        if not target:
+            _LOGGER.debug(
+                "No notify device configured; skipping notification %r", title
+            )
+            return
+        target = target.replace("/", ".")
+        if "." not in target:
+            target = f"{NOTIFY_DOMAIN}.{target}"
+        domain, _, service = target.partition(".")
+        service_data: dict[str, Any] = {"title": title, "message": message}
+        if actions:
+            service_data["data"] = {"tag": tag, "actions": actions}
+        try:
+            await self.hass.services.async_call(
+                domain, service, service_data, blocking=True
+            )
+        except (HomeAssistantError, asyncio.TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.warning(
+                "Could not send notification via %s: %s", target, err
+            )
+
+    async def _async_notify_ambiguous(
+        self, item: InventoryItem | None, prompt: str
+    ) -> None:
+        """Dispatch the actionable notification for an ambiguous movement."""
+        if item is None:
+            await self._async_notify_unknown_item(prompt, DETECTION_AMBIGUOUS)
+            return
+        tag = f"fridge_vision_{uuid.uuid4().hex[:8]}"
+        self._pending_ambiguous[tag] = {
+            "item_id": item.id,
+            "prompt": prompt,
+            "expires": dt_util.utcnow()
+            + timedelta(minutes=PENDING_LIFETIME_MINUTES),
+        }
+        actions = [
+            {
+                "action": ACTION_INSERT,
+                "title": "Włożyłem",
+                "item_id": item.id,
+                "tag": tag,
+            },
+            {
+                "action": ACTION_REMOVE,
+                "title": "Wyjąłem",
+                "item_id": item.id,
+                "tag": tag,
+            },
+            {
+                "action": ACTION_IGNORE,
+                "title": "Ignoruj",
+                "item_id": item.id,
+                "tag": tag,
+            },
+        ]
+        await self._async_notify(
+            NOTIFICATION_TITLE_AMBIGUOUS,
+            f"Wykryto: {item.name}. Co zrobiłeś?",
+            actions=actions,
+            tag=tag,
+        )
+
+    async def _async_notify_unknown_item(self, prompt: str, action: str) -> None:
+        """Inform about a detection that has no matching inventory item."""
+        await self._async_notify(
+            NOTIFICATION_TITLE_UNKNOWN_ITEM,
+            f"Wykryto ruch ({action}) dla produktu \"{prompt}\", "
+            "ale nie znaleziono go w inwentarzu.",
+        )
+
+    async def _async_report_analysis_error(self, message: str) -> None:
+        """Surface analysis failures as a persistent notification."""
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "Fridge Vision Inventory: błąd analizy",
+                    "message": f"Nie udało się przeanalizować sekwencji: {message}",
+                    "notification_id": f"{DOMAIN}_analysis_error",
+                },
+                blocking=False,
+            )
+        except HomeAssistantError as err:
+            _LOGGER.warning("Could not create persistent notification: %s", err)
+
+    def _schedule_reparameterize(self) -> None:
+        """Fire-and-forget model re-parameterization in the background."""
+        self._background_tasks = [
+            task for task in self._background_tasks if not task.done()
+        ]
+        self._background_tasks.append(
+            self.hass.async_create_background_task(
+                self._async_reparameterize_best_effort(),
+                f"{DOMAIN}_reparameterize",
+            )
+        )
+
+    async def _async_reparameterize_best_effort(self) -> None:
+        try:
+            await self.async_reparameterize_model()
+        except VisionApiError as err:
+            _LOGGER.warning("Re-parameterization failed: %s", err)
+
+    async def async_reparameterize_model(self) -> bool:
+        """Push all unique ai_prompts to the add-on; raises on API failure."""
         prompts = sorted(
             {
-                item.get("ai_prompt")
-                for item in self.items
-                if item.get("ai_prompt")
+                item.ai_prompt.strip()
+                for item in self.items.values()
+                if item.ai_prompt.strip()
             }
         )
         if not prompts:
-            return
-        try:
-            async with async_timeout.timeout(REPARAMETERIZE_TIMEOUT_SECONDS):
-                response = await self._session.post(
-                    f"{self.ai_service_url}/api/set_classes",
-                    json={"classes": prompts},
-                )
-                response.raise_for_status()
-        except Exception as err:
-            _LOGGER.warning(
-                "Failed to reparameterize model at %s: %s", self.ai_service_url, err
+            _LOGGER.info("No AI prompts configured; skipping re-parameterization")
+            return False
+        await self._client.async_set_classes(prompts)
+        _LOGGER.info(
+            "Model re-parameterized with %d class(es): %s", len(prompts), prompts
+        )
+        return True
+
+    async def async_add_item(
+        self,
+        name: str,
+        ai_prompt: str,
+        quantity: int = 1,
+        location: str = DEFAULT_LOCATION,
+    ) -> InventoryItem:
+        """Create an inventory item and re-parameterize the model."""
+        name_clean = str(name).strip()
+        prompt_clean = str(ai_prompt).strip()
+        if not name_clean:
+            raise HomeAssistantError("Item name must not be empty")
+        if not prompt_clean:
+            raise HomeAssistantError("AI prompt must not be empty")
+        item = InventoryItem(
+            id=uuid.uuid4().hex,
+            name=name_clean,
+            ai_prompt=prompt_clean,
+            quantity=max(0, int(quantity)),
+            location=str(location).strip() or DEFAULT_LOCATION,
+            last_updated=dt_util.utcnow().isoformat(),
+        )
+        self.items[item.id] = item
+        await self._async_schedule_save()
+        self._async_signal_items_updated()
+        _LOGGER.info("Added item %s (prompt: %s)", item.name, item.ai_prompt)
+        self._schedule_reparameterize()
+        return item
+
+    async def async_update_quantity(self, item_id: str, delta: int) -> InventoryItem:
+        """Increment or decrement an item quantity (clamped at zero)."""
+        item = self.items.get(item_id)
+        if item is None:
+            raise HomeAssistantError(f"Unknown item id: {item_id}")
+        item.quantity = max(0, item.quantity + int(delta))
+        self._touch(item)
+        await self._async_schedule_save()
+        self._async_signal_items_updated()
+        return item
+
+    async def async_delete_item(self, item_id: str) -> None:
+        """Remove an inventory item and re-parameterize the model."""
+        item = self.items.pop(item_id, None)
+        if item is None:
+            raise HomeAssistantError(f"Unknown item id: {item_id}")
+        await self._async_schedule_save()
+        self._async_signal_items_updated()
+        _LOGGER.info("Deleted item %s", item.name)
+        self._schedule_reparameterize()
+
+    def sorted_items(self) -> list[InventoryItem]:
+        """Items sorted by display name (for the WebSocket API)."""
+        return sorted(self.items.values(), key=lambda item: item.name.casefold())
+
+    def _find_item_by_prompt(self, prompt: str) -> InventoryItem | None:
+        wanted = prompt.strip().casefold()
+        for item in self.items.values():
+            if item.ai_prompt.strip().casefold() == wanted:
+                return item
+        return None
+
+    @callback
+    def register_image_entity(self, entity: Any) -> None:
+        """Register the image entity that displays annotated frames."""
+        self._image_entity = entity
+
+    @callback
+    def unregister_image_entity(self, entity: Any) -> None:
+        """Unregister the image entity."""
+        if self._image_entity is entity:
+            self._image_entity = None
+
+    async def async_shutdown(self) -> None:
+        """Cancel tasks, remove listeners and flush the store."""
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
+        tasks = [
+            task
+            for task in (
+                self._capture_task,
+                self._analysis_task,
+                *self._background_tasks,
             )
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                try:
+                    await task
+                except Exception as err:  # noqa: BLE001 - shutdown must not fail
+                    _LOGGER.debug("Background task ended with error: %s", err)
+        self._capture_task = None
+        self._analysis_task = None
+        self._background_tasks.clear()
+        if self._dirty:
+            await self._store.async_save(self.items)
+            self._dirty = False

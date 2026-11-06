@@ -1,9 +1,14 @@
+# PyTorch CPU-only wheels come from the dedicated CPU wheel index.
+# The Dockerfile installs torch/torchvision explicitly from
+# https://download.pytorch.org/whl/cpu before applying this file; the
+# --extra-index-url line below also lets a plain `pip install -r
+# requirements.txt` resolve CPU-only builds (the +cpu local version sorts
+# above the CUDA-enabled PyPI build of the same release).
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.3.1
-ultralytics==8.2.0
-git+https://github.com/ultralytics/CLIP.git
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-opencv-python-headless==4.8.1.78
-numpy==1.26.4
-Pillow==10.1.0
+torch>=2.4.0,<2.8.0
+torchvision>=0.19.0,<0.23.0
+ultralytics>=8.3.0,<9.0.0
+fastapi>=0.115.0,<1.0.0
+uvicorn>=0.30.0,<1.0.0
+pydantic>=2.7.0,<3.0.0
+numpy>=1.26.0,<3.0.0

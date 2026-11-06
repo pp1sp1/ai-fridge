@@ -1,0 +1,93 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Fridge Vision Inventory",
+        "description": "Connect the integration to the Fridge Vision AI add-on. The default URL works when the add-on runs on the same Home Assistant OS instance ({example_url}).",
+        "data": {
+          "ai_service_url": "Vision AI service URL",
+          "camera_entity": "Fridge camera entity",
+          "door_sensor_entity": "Fridge door sensor",
+          "capture_fps": "Capture rate (FPS)",
+          "motion_vector_insert_direction": "Motion vector for insertions",
+          "confidence_threshold": "Confidence threshold",
+          "notify_device": "Notification target (optional)"
+        },
+        "data_description": {
+          "ai_service_url": "Base URL of the add-on API, e.g. {example_url}. Check the Fridge Vision AI add-on page for the exact hostname.",
+          "camera_entity": "Camera used to grab frames while the door is open.",
+          "door_sensor_entity": "Binary sensor reporting door state (on = open).",
+          "capture_fps": "Frames per second captured during door-open (1-10).",
+          "motion_vector_insert_direction": "Direction the hand moves when inserting items: top_to_bottom or bottom_to_top.",
+          "confidence_threshold": "Minimum detection confidence (0.05-0.95) required to change the inventory.",
+          "notify_device": "Notify target for ambiguous movements, e.g. notify.mobile_app_phone. Leave empty to skip notifications."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the Vision AI service. Start the Fridge Vision AI add-on first and check the URL."
+    },
+    "abort": {
+      "already_configured": "Fridge Vision Inventory is already configured."
+    }
+  },
+  "entity": {
+    "image": {
+      "last_detection": {
+        "name": "Fridge last detection"
+      }
+    }
+  },
+  "services": {
+    "add_item": {
+      "name": "Add item",
+      "description": "Adds an inventory item and re-parameterizes the AI model with all configured AI prompts.",
+      "fields": {
+        "name": {
+          "name": "Name",
+          "description": "Display name of the product, e.g. \"Mleko 3.2%\"."
+        },
+        "ai_prompt": {
+          "name": "AI prompt",
+          "description": "English detection prompt for YOLO-World, e.g. \"milk carton\"."
+        },
+        "quantity": {
+          "name": "Quantity",
+          "description": "Initial quantity (0 or more)."
+        },
+        "location": {
+          "name": "Location",
+          "description": "Storage location of the item."
+        }
+      }
+    },
+    "update_quantity": {
+      "name": "Update quantity",
+      "description": "Increments or decrements the quantity of an inventory item.",
+      "fields": {
+        "item_id": {
+          "name": "Item ID",
+          "description": "ID of the inventory item."
+        },
+        "delta": {
+          "name": "Delta",
+          "description": "Amount to add (use a negative value to subtract; clamped at 0)."
+        }
+      }
+    },
+    "delete_item": {
+      "name": "Delete item",
+      "description": "Removes an inventory item and re-parameterizes the AI model.",
+      "fields": {
+        "item_id": {
+          "name": "Item ID",
+          "description": "ID of the inventory item to delete."
+        }
+      }
+    },
+    "reparameterize_model": {
+      "name": "Reparameterize model",
+      "description": "Gathers all unique AI prompts from the inventory and pushes them to the Vision AI add-on via /api/set_classes."
+    }
+  }
+}

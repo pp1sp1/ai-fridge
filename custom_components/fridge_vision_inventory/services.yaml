@@ -1,47 +1,77 @@
 add_item:
-  name: "Dodaj produkt"
-  description: "Dodaje nowy produkt do inwentarza i uruchamia reparametryzację modelu YOLO-World na add-onie."
+  name: Add item
+  description: >
+    Adds an inventory item and re-parameterizes the AI model with all
+    configured AI prompts.
   fields:
     name:
-      name: "Nazwa (PL)"
-      description: "Nazwa wyświetlana produktu w języku polskim, np. Mleko 3.2%"
+      name: Name
+      description: Display name of the product, e.g. "Mleko 3.2%".
+      required: true
       example: "Mleko 3.2%"
-      required: true
+      selector:
+        text:
     ai_prompt:
-      name: "Prompt AI (EN)"
-      description: "Angielski opis produktu używany przez model YOLO-World, np. milk carton"
+      name: AI prompt
+      description: English detection prompt for YOLO-World, e.g. "milk carton".
+      required: true
       example: "milk carton"
-      required: true
+      selector:
+        text:
     quantity:
-      name: "Ilość"
-      description: "Początkowa ilość produktu (liczba całkowita >= 0)"
+      name: Quantity
+      description: Initial quantity (0 or more).
+      default: 1
       example: 1
-      required: false
+      selector:
+        number:
+          min: 0
+          max: 9999
+          step: 1
+          mode: box
     location:
-      name: "Lokalizacja"
-      description: "Lokalizacja produktu, np. fridge"
+      name: Location
+      description: Storage location of the item.
+      default: "fridge"
       example: "fridge"
-      required: false
+      selector:
+        text:
 update_quantity:
-  name: "Zaktualizuj ilość"
-  description: "Zmienia ilość produktu o podaną różnicę (delta). Wynik jest ograniczony do >= 0."
+  name: Update quantity
+  description: Increments or decrements the quantity of an inventory item.
   fields:
     item_id:
-      name: "Identyfikator produktu"
-      description: "Unikalny identyfikator produktu (UUID)"
+      name: Item ID
+      description: ID of the inventory item (shown on the item sensor attributes).
       required: true
+      example: "6f0d3a1e8c2b4f6e9d7a1b2c3d4e5f60"
+      selector:
+        text:
     delta:
-      name: "Różnica"
-      description: "Zmiana ilości, np. 1 lub -1"
+      name: Delta
+      description: Amount to add (use a negative value to subtract; clamped at 0).
       required: true
+      example: 1
+      default: 1
+      selector:
+        number:
+          min: -999
+          max: 999
+          step: 1
+          mode: box
 delete_item:
-  name: "Usuń produkt"
-  description: "Usuwa produkt z inwentarza i uruchamia reparametryzację modelu YOLO-World na add-onie."
+  name: Delete item
+  description: Removes an inventory item and re-parameterizes the AI model.
   fields:
     item_id:
-      name: "Identyfikator produktu"
-      description: "Unikalny identyfikator produktu (UUID)"
+      name: Item ID
+      description: ID of the inventory item to delete.
       required: true
+      example: "6f0d3a1e8c2b4f6e9d7a1b2c3d4e5f60"
+      selector:
+        text:
 reparameterize_model:
-  name: "Przetwórz model ponownie"
-  description: "Zbiera wszystkie unikalne prompty AI z inwentarza i wysyła je do add-onu Fridge Vision AI (/api/set_classes)."
+  name: Reparameterize model
+  description: >
+    Gathers all unique AI prompts from the inventory and pushes them to the
+    Vision AI add-on via /api/set_classes.

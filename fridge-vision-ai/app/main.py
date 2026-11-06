@@ -1,253 +1,312 @@
-"""FastAPI service for the Fridge Vision AI add-on."""
+"""FastAPI service for the Fridge Vision AI add-on.
+
+Endpoints:
+* ``GET  /api/health``           - service and model status
+* ``POST /api/set_classes``      - zero-shot re-parameterization with prompts
+* ``POST /api/analyze_sequence`` - classify a door-open frame sequence
+
+Add-on options are read from ``/data/options.json`` (written by the
+Home Assistant Supervisor); sane defaults are used when the file is
+absent so the service also runs outside of the Supervisor for testing.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import cv2
-import numpy as np
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+import binascii
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator, Literal, Sequence
 
-from .model import YOLOWorldEngine
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
+
+from .model import (
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_MODEL_NAME,
+    SUPPORTED_MODELS,
+    ModelNotLoadedError,
+    VisionModel,
+)
 from .tracker import (
+    DEFAULT_MOTION_THRESHOLD,
     Detection,
-    Track,
-    compute_centroid,
-    evaluate_action,
-    match_tracks,
-    MOTION_THRESHOLD_PX,
+    CentroidTracker,
+    analyze_tracks,
+    annotate_frame,
+    decode_jpeg,
+    encode_jpeg,
 )
 
-app = FastAPI(title="Fridge Vision AI")
+LOGGER = logging.getLogger("fridge_vision_ai")
 
-engine = YOLOWorldEngine()
+OPTIONS_FILE = Path(os.environ.get("FRIDGE_VISION_OPTIONS_FILE", "/data/options.json"))
 
-MAX_CENTROID_DISTANCE = 60.0
-MIN_IOU = 0.3
+MAX_FRAMES = 150
+MAX_TOTAL_BASE64_BYTES = 160 * 1024 * 1024
+
+
+@dataclass(slots=True, frozen=True)
+class Settings:
+    """Static settings derived from the add-on options."""
+
+    model_name: str
+    image_size: int
+    log_level: str
+
+
+def _load_settings() -> Settings:
+    """Read add-on options; fall back to defaults outside of Supervisor."""
+    options: dict[str, Any] = {}
+    try:
+        if OPTIONS_FILE.is_file():
+            options = json.loads(OPTIONS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        LOGGER.warning("Could not read options file %s: %s", OPTIONS_FILE, err)
+
+    model_name = str(options.get("model", DEFAULT_MODEL_NAME))
+    if model_name not in SUPPORTED_MODELS:
+        LOGGER.warning(
+            "Unsupported model %r in options, falling back to %s",
+            model_name,
+            DEFAULT_MODEL_NAME,
+        )
+        model_name = DEFAULT_MODEL_NAME
+
+    try:
+        image_size = int(options.get("image_size", DEFAULT_IMAGE_SIZE))
+    except (TypeError, ValueError):
+        image_size = DEFAULT_IMAGE_SIZE
+    image_size = min(max(image_size, 320), 1280)
+
+    log_level = str(options.get("log_level", "info")).upper()
+    return Settings(model_name=model_name, image_size=image_size, log_level=log_level)
+
+
+SETTINGS = _load_settings()
+
+logging.basicConfig(
+    level=getattr(logging, SETTINGS.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+
+MODEL = VisionModel(model_name=SETTINGS.model_name, image_size=SETTINGS.image_size)
+
+
+class _FrameDecodeError(Exception):
+    """Raised when a frame cannot be decoded; carries the frame index."""
+
+    def __init__(self, index: int, reason: str) -> None:
+        super().__init__(f"frame {index}: {reason}")
+        self.index = index
+        self.reason = reason
 
 
 class SetClassesRequest(BaseModel):
-    classes: list[str] = Field(..., min_length=1)
+    """Payload for ``POST /api/set_classes``."""
+
+    classes: list[str] = Field(min_length=1, max_length=64)
+
+    @field_validator("classes")
+    @classmethod
+    def _validate_classes(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item and item.strip()]
+        if not cleaned:
+            raise ValueError("at least one non-empty class prompt is required")
+        return cleaned
 
 
-class AnalyzeSequenceRequest(BaseModel):
-    frames: list[str] = Field(..., min_length=1)
-    vector_direction: str = Field("top_to_bottom")
-    confidence_threshold: float = Field(0.25, ge=0.0, le=1.0)
+class SetClassesResponse(BaseModel):
+    """Response for ``POST /api/set_classes``."""
+
+    classes: list[str]
+
+
+class AnalyzeRequest(BaseModel):
+    """Payload for ``POST /api/analyze_sequence``."""
+
+    frames: list[str] = Field(min_length=1, max_length=MAX_FRAMES)
+    vector_direction: Literal["top_to_bottom", "bottom_to_top"] = "top_to_bottom"
+    confidence_threshold: float = Field(default=0.25, ge=0.01, le=0.95)
+    motion_threshold: float = Field(
+        default=DEFAULT_MOTION_THRESHOLD, ge=0.005, le=0.5
+    )
 
 
 class DetectionOut(BaseModel):
+    """One classified motion track."""
+
     ai_prompt: str
-    action: str  # "INSERTED" | "REMOVED" | "AMBIGUOUS"
+    action: str
     confidence: float
     track_length_frames: int
+    delta_y_px: float = 0.0
 
 
-class AnalyzeSequenceResponse(BaseModel):
+class AnalyzeResponse(BaseModel):
+    """Response for ``POST /api/analyze_sequence``."""
+
     detections: list[DetectionOut]
     annotated_image_base64: str
 
 
-def _decode_frame(b64: str) -> np.ndarray:
-    """Decode a base64 JPEG string (with or without a data-URL prefix)."""
-    if "," in b64:
-        b64 = b64.split(",", 1)[1]
-    raw = base64.b64decode(b64)
-    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("Failed to decode frame")
-    return image
-
-
-def _encode_image(image: np.ndarray) -> str:
-    """Encode an image as a base64 JPEG string."""
-    ok, buffer = cv2.imencode(
-        ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Load the model once at startup, in a worker thread."""
+    model: VisionModel = app.state.model
+    if not model.ready:
+        await asyncio.to_thread(model.load)
+    LOGGER.info(
+        "Fridge Vision AI ready (model=%s, classes=%s)",
+        model.model_name,
+        list(model.classes),
     )
-    if not ok:
-        raise RuntimeError("Failed to encode annotated image")
-    return base64.b64encode(buffer).decode("ascii")
+    yield
 
 
-def _draw_annotations(
-    image: np.ndarray,
-    tracks: List[Track],
-    actions: dict,
+def _run_pipeline(
+    model: VisionModel,
+    frames_base64: Sequence[str],
+    confidence_threshold: float,
     vector_direction: str,
-) -> np.ndarray:
-    """Draw bounding boxes, labels and motion arrows onto a copy of the image."""
-    annotated = image.copy()
-    height, width = annotated.shape[:2]
-    scale = max(1.0, min(width, height) / 500.0)
-
-    action_colors = {
-        "INSERTED": (0, 200, 0),    # green
-        "REMOVED": (0, 0, 200),     # red
-        "AMBIGUOUS": (0, 200, 200), # yellow
-    }
-
-    for track in tracks:
-        if not track.detections:
-            continue
-        last = track.detections[-1]
-        x1, y1, x2, y2 = (int(v) for v in last.bbox)
-
-        eval_result = actions.get(id(track))
-        color = (128, 128, 128)
-        label = f"{track.label} {last.confidence:.2f}"
-        if eval_result is not None:
-            action = eval_result["action"]
-            color = action_colors.get(action, (128, 128, 128))
-            label = (
-                f"{track.label} [{action}] {eval_result['confidence']:.2f}"
+    motion_threshold: float,
+) -> tuple[list[DetectionOut], bytes]:
+    """Decode, infer and track the whole sequence (runs in a worker thread)."""
+    tracker = CentroidTracker()
+    frame_height: int | None = None
+    for index, frame_b64 in enumerate(frames_base64):
+        try:
+            raw = base64.b64decode(frame_b64, validate=False)
+        except (binascii.Error, ValueError) as err:
+            raise _FrameDecodeError(index, "payload is not valid base64") from err
+        frame = decode_jpeg(raw)
+        if frame is None:
+            raise _FrameDecodeError(index, "payload is not a decodable JPEG image")
+        height, width = frame.shape[:2]
+        if frame_height is None:
+            frame_height = height
+        raw_boxes = model.infer(frame, confidence_threshold)
+        detections = [
+            Detection(
+                frame_index=index,
+                bbox=box.bbox,
+                prompt=box.prompt,
+                confidence=box.confidence,
             )
+            for box in raw_boxes
+        ]
+        tracker.update(index, detections, width, height)
 
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            annotated,
-            label,
-            (x1, max(0, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55 * scale,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+    assert frame_height is not None
+    track_results, best_index = analyze_tracks(
+        tracker.tracks, vector_direction, motion_threshold, frame_height
+    )
 
-        # Motion arrow from the first to the last centroid of the track.
-        if len(track.detections) >= 2:
-            first_c = track.detections[0].centroid
-            last_c = track.detections[-1].centroid
-            p1 = (int(first_c[0]), int(first_c[1]))
-            p2 = (int(last_c[0]), int(last_c[1]))
-            cv2.arrowedLine(annotated, p1, p2, color, 2, cv2.LINE_AA)
-            cv2.circle(annotated, p1, 5, (255, 255, 0), -1)
-            cv2.circle(annotated, p2, 5, color, -1)
-
-    return annotated
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    engine.load()
-
-
-@app.post("/api/set_classes", response_model=dict)
-async def set_classes(request: SetClassesRequest) -> dict:
-    """Re-parametrize the YOLO-World CLIP text encoder with new prompts."""
     try:
-        engine.set_classes(request.classes)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"status": "ok", "classes": engine.classes()}
+        best_raw = base64.b64decode(frames_base64[best_index], validate=False)
+    except (binascii.Error, ValueError) as err:
+        raise _FrameDecodeError(best_index, "best frame is not valid base64") from err
+    best_frame = decode_jpeg(best_raw)
+    if best_frame is None:
+        raise _FrameDecodeError(best_index, "best frame is not a decodable JPEG image")
+    annotated = annotate_frame(best_frame, track_results)
 
-
-@app.post("/api/analyze_sequence", response_model=AnalyzeSequenceResponse)
-async def analyze_sequence(request: AnalyzeSequenceRequest) -> AnalyzeSequenceResponse:
-    """Analyze a sequence of frames and classify insert/remove motion."""
-    if request.vector_direction not in (
-        "top_to_bottom",
-        "bottom_to_top",
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="vector_direction must be 'top_to_bottom' or 'bottom_to_top'",
-        )
-
-    frames: list[np.ndarray] = []
-    for b64 in request.frames:
-        try:
-            frames.append(_decode_frame(b64))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    # Run YOLO-World inference on every frame.
-    per_frame_detections: list[list[Detection]] = []
-    for idx, frame in enumerate(frames):
-        try:
-            results = engine.predict(frame, conf=request.confidence_threshold)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
-
-        detections: list[Detection] = []
-        for result in results:
-            boxes = result.boxes
-            if boxes is None:
-                continue
-            for box in boxes:
-                cls_id = int(box.cls[0])
-                label = result.names[cls_id]
-                confidence = float(box.conf[0])
-                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-                centroid = compute_centroid((x1, y1, x2, y2))
-                detections.append(
-                    Detection(
-                        label=label,
-                        confidence=confidence,
-                        bbox=(x1, y1, x2, y2),
-                        centroid=centroid,
-                        frame_index=idx,
-                    )
-                )
-        per_frame_detections.append(detections)
-
-    # Track objects across consecutive frames.
-    tracks: List[Track] = []
-    active: List[Track] = []
-    for detections in per_frame_detections:
-        matched_tracks, matched_detections, unmatched = match_tracks(
-            active, detections, MAX_CENTROID_DISTANCE, MIN_IOU
-        )
-        matched_set = set(matched_tracks)
-
-        # Extend matched tracks with their new detections.
-        for ti, di in zip(matched_tracks, matched_detections):
-            active[ti].detections.append(detections[di])
-
-        # Tracks not matched this frame are completed.
-        still_active: List[Track] = []
-        for ti, track in enumerate(active):
-            if ti in matched_set:
-                still_active.append(track)
-            else:
-                tracks.append(track)
-
-        # Unmatched detections start new tracks.
-        for di in unmatched:
-            still_active.append(
-                Track(label=detections[di].label, detections=[detections[di]])
-            )
-        active = still_active
-
-    # Tracks still open at the end of the sequence are completed now.
-    tracks.extend(active)
-
-    # Evaluate every completed track.
-    actions: dict = {}
-    for track in tracks:
-        result = evaluate_action(track, request.vector_direction, MOTION_THRESHOLD_PX)
-        if result is not None:
-            actions[id(track)] = result
-
-    # Annotate the last frame of the sequence.
-    best_frame = frames[len(frames) - 1]
-    annotated = _draw_annotations(
-        best_frame, tracks, actions, request.vector_direction
-    )
-
-    detection_out = [
+    outputs = [
         DetectionOut(
-            ai_prompt=result["ai_prompt"],
-            action=result["action"],
-            confidence=result["confidence"],
-            track_length_frames=result["track_length_frames"],
+            ai_prompt=result.ai_prompt,
+            action=result.action,
+            confidence=result.confidence,
+            track_length_frames=result.track_length_frames,
+            delta_y_px=result.delta_y,
         )
-        for result in actions.values()
+        for result in track_results
     ]
+    return outputs, encode_jpeg(annotated)
 
-    return AnalyzeSequenceResponse(
-        detections=detection_out,
-        annotated_image_base64=_encode_image(annotated),
+
+def create_app(vision_model: VisionModel | None = None) -> FastAPI:
+    """Create the FastAPI application; ``vision_model`` allows test injection."""
+    application = FastAPI(
+        title="Fridge Vision AI", version="1.0.0", lifespan=_lifespan
     )
+    application.state.model = vision_model if vision_model is not None else MODEL
+    application.state.settings = SETTINGS
+
+    @application.get("/")
+    async def root() -> dict[str, str]:
+        """Service banner."""
+        return {
+            "service": "Fridge Vision AI",
+            "endpoints": "/api/health, /api/set_classes, /api/analyze_sequence",
+        }
+
+    @application.get("/api/health")
+    async def health(request: Request) -> dict[str, Any]:
+        """Health endpoint used by the Supervisor watchdog and the integration."""
+        model: VisionModel = request.app.state.model
+        return {
+            "status": "ok",
+            "model": model.model_name,
+            "model_ready": model.ready,
+            "classes": list(model.classes),
+            "device": "cpu",
+        }
+
+    @application.post("/api/set_classes", response_model=SetClassesResponse)
+    async def set_classes(
+        payload: SetClassesRequest, request: Request
+    ) -> SetClassesResponse:
+        """Re-parameterize the model with zero-shot text prompts."""
+        model: VisionModel = request.app.state.model
+        if not model.ready:
+            raise HTTPException(
+                status_code=503, detail="model is still loading; retry shortly"
+            )
+        try:
+            classes = await asyncio.to_thread(model.set_classes, payload.classes)
+        except ModelNotLoadedError as err:
+            raise HTTPException(status_code=503, detail=str(err)) from err
+        except ValueError as err:
+            raise HTTPException(status_code=422, detail=str(err)) from err
+        return SetClassesResponse(classes=list(classes))
+
+    @application.post("/api/analyze_sequence", response_model=AnalyzeResponse)
+    async def analyze_sequence(
+        payload: AnalyzeRequest, request: Request
+    ) -> AnalyzeResponse:
+        """Classify motions in a buffered door-open sequence."""
+        model: VisionModel = request.app.state.model
+        if not model.ready:
+            raise HTTPException(
+                status_code=503, detail="model is still loading; retry shortly"
+            )
+        total_bytes = sum(len(frame) for frame in payload.frames)
+        if total_bytes > MAX_TOTAL_BASE64_BYTES:
+            raise HTTPException(status_code=413, detail="frame payload too large")
+        try:
+            detections, annotated = await asyncio.to_thread(
+                _run_pipeline,
+                model,
+                payload.frames,
+                payload.confidence_threshold,
+                payload.vector_direction,
+                payload.motion_threshold,
+            )
+        except _FrameDecodeError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+        except ModelNotLoadedError as err:
+            raise HTTPException(status_code=503, detail=str(err)) from err
+        return AnalyzeResponse(
+            detections=detections,
+            annotated_image_base64=base64.b64encode(annotated).decode("ascii"),
+        )
+
+    return application
+
+
+app = create_app()

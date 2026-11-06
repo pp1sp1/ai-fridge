@@ -1,0 +1,93 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Fridge Vision Inventory",
+        "description": "Połącz integrację z dodatkiem Fridge Vision AI. Domyślny adres działa, gdy dodatek działa na tej samej instancji Home Assistant OS ({example_url}).",
+        "data": {
+          "ai_service_url": "Adres usługi Vision AI",
+          "camera_entity": "Encja kamery lodówki",
+          "door_sensor_entity": "Czujnik otwarcia drzwi lodówki",
+          "capture_fps": "Częstotliwość zapisu klatek (FPS)",
+          "motion_vector_insert_direction": "Wektor ruchu dla wkładania",
+          "confidence_threshold": "Próg pewności detekcji",
+          "notify_device": "Cel powiadomień (opcjonalnie)"
+        },
+        "data_description": {
+          "ai_service_url": "Bazowy adres API dodatku, np. {example_url}. Dokładną nazwę hosta znajdziesz na stronie dodatku Fridge Vision AI.",
+          "camera_entity": "Kamera używana do zapisu klatek podczas otwarcia drzwi.",
+          "door_sensor_entity": "Czujnik binarny raportujący stan drzwi (on = otwarte).",
+          "capture_fps": "Liczba klatek na sekundę zapisywanych podczas otwarcia drzwi (1-10).",
+          "motion_vector_insert_direction": "Kierunek ruchu ręki przy wkładaniu produktów: top_to_bottom lub bottom_to_top.",
+          "confidence_threshold": "Minimalna pewność detekcji (0.05-0.95) wymagana do zmiany stanu inwentarza.",
+          "notify_device": "Cel powiadomień o niepewnych ruchach, np. notify.mobile_app_phone. Puste = bez powiadomień."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Nie można połączyć się z usługą Vision AI. Najpierw uruchom dodatek Fridge Vision AI i sprawdź adres."
+    },
+    "abort": {
+      "already_configured": "Fridge Vision Inventory jest już skonfigurowane."
+    }
+  },
+  "entity": {
+    "image": {
+      "last_detection": {
+        "name": "Ostatnie wykrycie (lodówka)"
+      }
+    }
+  },
+  "services": {
+    "add_item": {
+      "name": "Dodaj produkt",
+      "description": "Dodaje produkt do inwentarza i re-parametryzuje model AI ze wszystkimi skonfigurowanymi promptami.",
+      "fields": {
+        "name": {
+          "name": "Nazwa",
+          "description": "Nazwa wyświetlana produktu, np. \"Mleko 3.2%\"."
+        },
+        "ai_prompt": {
+          "name": "Prompt AI",
+          "description": "Angielski prompt detekcji dla YOLO-World, np. \"milk carton\"."
+        },
+        "quantity": {
+          "name": "Ilość",
+          "description": "Ilość początkowa (0 lub więcej)."
+        },
+        "location": {
+          "name": "Lokalizacja",
+          "description": "Miejsce przechowywania produktu."
+        }
+      }
+    },
+    "update_quantity": {
+      "name": "Zmień ilość",
+      "description": "Zwiększa lub zmniejsza ilość produktu w inwentarzu.",
+      "fields": {
+        "item_id": {
+          "name": "ID produktu",
+          "description": "Identyfikator produktu w inwentarzu."
+        },
+        "delta": {
+          "name": "Delta",
+          "description": "Ilość do dodania (wartość ujemna odejmuje; wynik ograniczony do 0)."
+        }
+      }
+    },
+    "delete_item": {
+      "name": "Usuń produkt",
+      "description": "Usuwa produkt z inwentarza i re-parametryzuje model AI.",
+      "fields": {
+        "item_id": {
+          "name": "ID produktu",
+          "description": "Identyfikator produktu do usunięcia."
+        }
+      }
+    },
+    "reparameterize_model": {
+      "name": "Re-parametryzuj model",
+      "description": "Zbiera wszystkie unikalne prompty AI z inwentarza i wysyła je do dodatku Vision AI przez /api/set_classes."
+    }
+  }
+}

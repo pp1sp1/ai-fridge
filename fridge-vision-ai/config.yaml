@@ -1,25 +1,29 @@
-name: "Fridge Vision AI"
+name: Fridge Vision AI
 version: "1.0.0"
-slug: "fridge_vision_ai"
-description: "YOLO-World v2 computer vision service for smart fridge inventory"
-startup: "services"
-boot: "auto"
+slug: fridge-vision-ai
+description: YOLO-World zero-shot vision service for the Fridge Vision Inventory integration.
+url: https://github.com/your-github-user/fridge-vision-inventory
 arch:
-  - aarch64
   - amd64
-  - armv7
+  - aarch64
+startup: services
+boot: auto
+init: false
 ports:
   8000/tcp: 8000
 ports_description:
-  8000/tcp: "FastAPI REST API"
-homeassistant_api: true
-hassio_api: true
-hassio_role: default
-map:
-  - ssl:rw
+  8000/tcp: Vision AI HTTP API
+watchdog: "http://[HOST]:8000/api/health"
+hassio_api: false
+homeassistant_api: false
+auth_api: false
+ingress: false
+host_network: false
 options:
-  model: yolov8s-worldv2.pt
-  confidence_threshold: 0.25
+  model: yolov8n-worldv2.pt
+  image_size: 640
+  log_level: info
 schema:
-  model: str
-  confidence_threshold: float
+  model: list(yolov8n-worldv2.pt|yolov8s-worldv2.pt)
+  image_size: int(320,1280)
+  log_level: list(trace|debug|info|warning|error|fatal)

@@ -1,6 +1,5 @@
 {
   "name": "Fridge Vision Inventory",
-  "country": ["PL"],
-  "domains": ["fridge_vision_inventory"],
-  "iot_class": "Assumed State"
+  "render_readme": true,
+  "homeassistant": "2024.6.0"
 }
