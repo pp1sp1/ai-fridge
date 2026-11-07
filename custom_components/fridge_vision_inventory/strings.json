@@ -3,117 +3,57 @@
     "step": {
       "user": {
         "title": "Fridge Vision Inventory",
-        "description": "Connect the integration to the Fridge Vision AI add-on. The default URL works when the add-on runs on the same Home Assistant OS instance ({example_url}).",
+        "description": "Połącz integrację wizyjną z modelem AI oraz magazynem simple_inventory.",
         "data": {
-          "ai_service_url": "Vision AI service URL",
-          "camera_entity": "Fridge camera entity",
-          "door_sensor_entity": "Fridge door sensor",
-          "capture_fps": "Capture rate (FPS)",
-          "motion_vector_insert_direction": "Motion vector for insertions",
-          "confidence_threshold": "Confidence threshold",
-          "notify_device": "Notification target (optional)"
+          "inventory_entity": "Encja magazynu (sensor simple_inventory)",
+          "ai_service_url": "Adres URL Add-ona AI",
+          "camera_entity": "Kamera lodówki",
+          "door_sensor_entity": "Czujnik otwarcia drzwi (binary_sensor)",
+          "capture_fps": "Klatki na sekundę (FPS)",
+          "motion_vector_insert_direction": "Kierunek wektora wkładania",
+          "confidence_threshold": "Próg pewności detekcji (0.05 - 0.95)",
+          "notify_device": "Cel powiadomień (opcjonalnie)"
         },
         "data_description": {
-          "ai_service_url": "Base URL of the add-on API, e.g. {example_url}. Check the Fridge Vision AI add-on page for the exact hostname.",
-          "camera_entity": "Camera used to grab frames while the door is open.",
-          "door_sensor_entity": "Binary sensor reporting door state (on = open).",
-          "capture_fps": "Frames per second captured during door-open (1-10).",
-          "motion_vector_insert_direction": "Direction the hand moves when inserting items: top_to_bottom or bottom_to_top.",
-          "confidence_threshold": "Minimum detection confidence (0.05-0.95) required to change the inventory.",
-          "notify_device": "Notify target for ambiguous movements, e.g. notify.mobile_app_phone. Leave empty to skip notifications."
+          "inventory_entity": "Encja sensor.* stworzona przez simple_inventory, np. sensor.lodowka.",
+          "ai_service_url": "Bazowy URL API dodatku, np. http://local_fridge-vision-ai:8000.",
+          "camera_entity": "Kamera robiąca zdjęcia podczas otwarcia drzwi.",
+          "door_sensor_entity": "Czujnik magnetyczny drzwi (on = otwarte).",
+          "capture_fps": "Częstotliwość rejestrowania klatek podczas otwarcia (1-10).",
+          "motion_vector_insert_direction": "Kierunek ruchu ręki przy wkładaniu do lodówki.",
+          "confidence_threshold": "Minimalna pewność modelu YOLO-World wymagana do zmiany stanu magazynu.",
+          "notify_device": "Nazwa usługi powiadomień dla niepewnych detekcji, np. notify.mobile_app_twoj_telefon."
         }
       }
     },
     "error": {
-      "cannot_connect": "Could not reach the Vision AI service. Start the Fridge Vision AI add-on first and check the URL."
+      "cannot_connect": "Nie udało się połączyć z dodatkiem Vision AI. Upewnij się, że Add-on jest uruchomiony."
     },
     "abort": {
-      "already_configured": "Fridge Vision Inventory is already configured."
+      "already_configured": "Integracja Fridge Vision Inventory jest już skonfigurowana."
     }
   },
-  "entity": {
-    "image": {
-      "last_detection": {
-        "name": "Fridge last detection"
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opcje Fridge Vision",
+        "data": {
+          "inventory_entity": "Encja magazynu (sensor simple_inventory)",
+          "ai_service_url": "Adres URL Add-ona AI",
+          "camera_entity": "Kamera lodówki",
+          "door_sensor_entity": "Czujnik otwarcia drzwi",
+          "capture_fps": "Klatki na sekundę (FPS)",
+          "motion_vector_insert_direction": "Kierunek wektora wkładania",
+          "confidence_threshold": "Próg pewności detekcji",
+          "notify_device": "Cel powiadomień (opcjonalnie)"
+        }
       }
     }
   },
   "services": {
-    "add_item": {
-      "name": "Add item",
-      "description": "Adds an inventory item and re-parameterizes the AI model with all configured AI prompts.",
-      "fields": {
-        "name": {
-          "name": "Name",
-          "description": "Display name of the product, e.g. \"Mleko 3.2%\"."
-        },
-        "ai_prompt": {
-          "name": "AI prompt",
-          "description": "English detection prompt for YOLO-World, e.g. \"milk carton\"."
-        },
-        "quantity": {
-          "name": "Quantity",
-          "description": "Initial quantity (0 or more)."
-        },
-        "location": {
-          "name": "Location",
-          "description": "Storage location of the item."
-        }
-      }
-    },
-    "update_item": {
-      "name": "Update item",
-      "description": "Updates name, AI prompt, quantity or location of an inventory item. Changing the AI prompt triggers a model re-parameterization. The prompt is required when adding an item, but it can be cleared while editing; an item without a prompt is kept in the inventory and simply stops being auto-detected.",
-      "fields": {
-        "item_id": {
-          "name": "Item ID",
-          "description": "ID of the inventory item to update."
-        },
-        "name": {
-          "name": "Name",
-          "description": "New display name of the product."
-        },
-        "ai_prompt": {
-          "name": "AI prompt",
-          "description": "New English detection prompt for YOLO-World, e.g. \"milk carton\". Optional: set an empty value to clear the prompt; the item is then no longer auto-detected."
-        },
-        "quantity": {
-          "name": "Quantity",
-          "description": "New quantity (0 or more)."
-        },
-        "location": {
-          "name": "Location",
-          "description": "New storage location of the item."
-        }
-      }
-    },
-    "update_quantity": {
-      "name": "Update quantity",
-      "description": "Increments or decrements the quantity of an inventory item.",
-      "fields": {
-        "item_id": {
-          "name": "Item ID",
-          "description": "ID of the inventory item."
-        },
-        "delta": {
-          "name": "Delta",
-          "description": "Amount to add (use a negative value to subtract; clamped at 0)."
-        }
-      }
-    },
-    "delete_item": {
-      "name": "Delete item",
-      "description": "Removes an inventory item and re-parameterizes the AI model.",
-      "fields": {
-        "item_id": {
-          "name": "Item ID",
-          "description": "ID of the inventory item to delete."
-        }
-      }
-    },
     "reparameterize_model": {
-      "name": "Reparameterize model",
-      "description": "Gathers all unique AI prompts from the inventory and pushes them to the Vision AI add-on via /api/set_classes."
+      "name": "Reparametryzuj model AI",
+      "description": "Wymusza natychmiastowe pobranie promptów zaczynających się od 'ai:' z magazynu simple_inventory i wysłanie ich do modelu YOLO-World."
     }
   }
 }

@@ -7,7 +7,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
     EntitySelector,
@@ -15,9 +15,9 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
-    SelectOptionDict,
     TextSelector,
 )
 
@@ -40,45 +40,71 @@ from .const import (
 )
 from .coordinator import VisionApiClient, VisionApiError
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_AI_SERVICE_URL, default=DEFAULT_AI_SERVICE_URL): str,
-        vol.Required(CONF_CAMERA_ENTITY): EntitySelector(
-            EntitySelectorConfig(domain="camera")
-        ),
-        vol.Required(CONF_DOOR_SENSOR_ENTITY): EntitySelector(
-            EntitySelectorConfig(domain="binary_sensor")
-        ),
-        vol.Required(CONF_CAPTURE_FPS, default=DEFAULT_CAPTURE_FPS): NumberSelector(
-            NumberSelectorConfig(min=1, max=10, step=1, mode=NumberSelectorMode.BOX)
-        ),
-        vol.Required(
-            CONF_MOTION_VECTOR_INSERT_DIRECTION,
-            default=DEFAULT_MOTION_VECTOR_INSERT_DIRECTION,
-        ): SelectSelector(
-            SelectSelectorConfig(
-                options=[
-                    SelectOptionDict(
-                        value=VECTOR_TOP_TO_BOTTOM,
-                        label="Top → bottom (ręka wchodzi z góry)",
-                    ),
-                    SelectOptionDict(
-                        value=VECTOR_BOTTOM_TO_TOP,
-                        label="Bottom → top (ręka wchodzi od dołu)",
-                    ),
-                ]
-            )
-        ),
-        vol.Required(
-            CONF_CONFIDENCE_THRESHOLD, default=DEFAULT_CONFIDENCE_THRESHOLD
-        ): NumberSelector(
-            NumberSelectorConfig(
-                min=0.05, max=0.95, step=0.05, mode=NumberSelectorMode.SLIDER
-            )
-        ),
-        vol.Optional(CONF_NOTIFY_DEVICE, default=""): TextSelector(),
-    }
-)
+CONF_INVENTORY_ENTITY = "inventory_entity"
+
+
+def _build_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
+    defaults = defaults or {}
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_INVENTORY_ENTITY,
+                default=defaults.get(CONF_INVENTORY_ENTITY, ""),
+            ): EntitySelector(EntitySelectorConfig(domain="sensor")),
+            vol.Required(
+                CONF_AI_SERVICE_URL,
+                default=defaults.get(CONF_AI_SERVICE_URL, DEFAULT_AI_SERVICE_URL),
+            ): str,
+            vol.Required(
+                CONF_CAMERA_ENTITY,
+                default=defaults.get(CONF_CAMERA_ENTITY, ""),
+            ): EntitySelector(EntitySelectorConfig(domain="camera")),
+            vol.Required(
+                CONF_DOOR_SENSOR_ENTITY,
+                default=defaults.get(CONF_DOOR_SENSOR_ENTITY, ""),
+            ): EntitySelector(EntitySelectorConfig(domain="binary_sensor")),
+            vol.Required(
+                CONF_CAPTURE_FPS,
+                default=defaults.get(CONF_CAPTURE_FPS, DEFAULT_CAPTURE_FPS),
+            ): NumberSelector(
+                NumberSelectorConfig(min=1, max=10, step=1, mode=NumberSelectorMode.BOX)
+            ),
+            vol.Required(
+                CONF_MOTION_VECTOR_INSERT_DIRECTION,
+                default=defaults.get(
+                    CONF_MOTION_VECTOR_INSERT_DIRECTION,
+                    DEFAULT_MOTION_VECTOR_INSERT_DIRECTION,
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(
+                            value=VECTOR_TOP_TO_BOTTOM,
+                            label="Top → bottom (ręka wchodzi z góry)",
+                        ),
+                        SelectOptionDict(
+                            value=VECTOR_BOTTOM_TO_TOP,
+                            label="Bottom → top (ręka wchodzi od dołu)",
+                        ),
+                    ]
+                )
+            ),
+            vol.Required(
+                CONF_CONFIDENCE_THRESHOLD,
+                default=defaults.get(
+                    CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0.05, max=0.95, step=0.05, mode=NumberSelectorMode.SLIDER
+                )
+            ),
+            vol.Optional(
+                CONF_NOTIFY_DEVICE,
+                default=defaults.get(CONF_NOTIFY_DEVICE, ""),
+            ): TextSelector(),
+        }
+    )
 
 
 class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -86,10 +112,17 @@ class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        return FridgeVisionOptionsFlow(config_entry)
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Handle the single-step setup form."""
+        """Handle the setup form."""
         errors: dict[str, str] = {}
         if user_input is not None:
             await self.async_set_unique_id(DOMAIN)
@@ -100,10 +133,6 @@ class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if notify and "." not in notify and "/" not in notify:
                 notify = f"{NOTIFY_DOMAIN}.{notify}"
 
-            # Own force_close session (closed right after the probe): the
-            # shared HA session can hand back a pooled connection the
-            # add-on already closed, which would show a spurious
-            # cannot_connect during setup.
             client = VisionApiClient(None, url)
             try:
                 await client.async_health()
@@ -116,11 +145,10 @@ class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(
                     title="Fridge Vision Inventory",
                     data={
+                        CONF_INVENTORY_ENTITY: user_input[CONF_INVENTORY_ENTITY],
                         CONF_AI_SERVICE_URL: url,
                         CONF_CAMERA_ENTITY: user_input[CONF_CAMERA_ENTITY],
-                        CONF_DOOR_SENSOR_ENTITY: user_input[
-                            CONF_DOOR_SENSOR_ENTITY
-                        ],
+                        CONF_DOOR_SENSOR_ENTITY: user_input[CONF_DOOR_SENSOR_ENTITY],
                         CONF_CAPTURE_FPS: int(user_input[CONF_CAPTURE_FPS]),
                         CONF_MOTION_VECTOR_INSERT_DIRECTION: user_input[
                             CONF_MOTION_VECTOR_INSERT_DIRECTION
@@ -134,7 +162,26 @@ class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
+            data_schema=_build_schema(),
             errors=errors,
             description_placeholders={"example_url": DEFAULT_AI_SERVICE_URL},
+        )
+
+
+class FridgeVisionOptionsFlow(config_entries.OptionsFlow):
+    """Allow updating settings via the Configure button in HA."""
+
+    def __init__(self, entry: config_entries.ConfigEntry) -> None:
+        self.entry = entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = {**self.entry.data, **self.entry.options}
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_build_schema(current),
         )

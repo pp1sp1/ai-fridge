@@ -2,21 +2,19 @@
   "domain": "fridge_vision_inventory",
   "name": "Fridge Vision Inventory",
   "codeowners": [
-    "@your-github-user"
+    "@pp1sp1"
   ],
   "config_flow": true,
-  "dependencies": [
-    "http",
-    "frontend"
-  ],
-  "documentation": "https://github.com/your-github-user/fridge-vision-inventory",
-  "integration_type": "hub",
-  "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/your-github-user/fridge-vision-inventory/issues",
-  "requirements": [],
+  "dependencies": [],
   "after_dependencies": [
     "camera",
-    "mobile_app"
+    "mobile_app",
+    "simple_inventory"
   ],
-  "version": "1.4.2"
+  "documentation": "https://github.com/pp1sp1/ai-fridge",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/pp1sp1/ai-fridge/issues",
+  "requirements": [],
+  "version": "2.0.0"
 }
