@@ -1,13 +1,4 @@
-"""Data coordinator for Fridge Vision Inventory.
-
-Integrates directly with simple_inventory:
-* Automatically extracts 'ai:' prompts from item aliases,
-* Automatically triggers debounced model re-parameterization when prompts change,
-* Grabs camera frames while the door is open (FIFO buffer),
-* Posts the sequence to the Vision AI add-on on door close,
-* Updates simple_inventory items (increment_item / decrement_item),
-* Updates the last detection image and status sensors.
-"""
+"""Data coordinator for Fridge Vision Inventory with rich logging."""
 
 from __future__ import annotations
 
@@ -127,6 +118,7 @@ class VisionApiClient:
         while True:
             attempt += 1
             try:
+                _LOGGER.debug("[AI Client] %s -> %s", method, url)
                 async with session.request(
                     method,
                     url,
@@ -136,13 +128,13 @@ class VisionApiClient:
                     body = await response.text()
                     if response.status >= 400:
                         raise VisionApiError(
-                            f"{method} {url} failed with HTTP {response.status}: {body[:200]}"
+                            f"{method} {url} błąd HTTP {response.status}: {body[:200]}"
                         )
             except (asyncio.TimeoutError, aiohttp.ClientError) as err:
                 if isinstance(err, _RETRYABLE_ERRORS) and attempt <= len(_RETRY_DELAYS):
                     delay = _RETRY_DELAYS[attempt - 1]
                     _LOGGER.warning(
-                        "%s %s failed (%s); retrying in %.1f s (attempt %d/%d)",
+                        "[AI Client] %s %s błąd (%s); ponawiam za %.1f s (próba %d/%d)",
                         method,
                         url,
                         err,
@@ -152,16 +144,14 @@ class VisionApiClient:
                     )
                     await asyncio.sleep(delay)
                     continue
-                raise VisionApiError(f"{method} {url} failed: {err}") from err
+                raise VisionApiError(f"{method} {url} błąd połączenia: {err}") from err
             break
         if not body:
             return {}
         try:
             return json.loads(body)
         except ValueError as err:
-            raise VisionApiError(
-                f"{method} {url} returned non-JSON response: {body[:200]}"
-            ) from err
+            raise VisionApiError(f"{method} {url} odpowiedź nie jest poprawnym JSON: {body[:200]}") from err
 
     async def async_health(self, timeout: float = HEALTH_TIMEOUT) -> dict[str, Any]:
         return await self._request("GET", "/api/health", timeout=timeout)
@@ -169,9 +159,7 @@ class VisionApiClient:
     async def async_set_classes(
         self, classes: list[str], timeout: float = SET_CLASSES_TIMEOUT
     ) -> dict[str, Any]:
-        return await self._request(
-            "POST", "/api/set_classes", {"classes": classes}, timeout=timeout
-        )
+        return await self._request("POST", "/api/set_classes", {"classes": classes}, timeout=timeout)
 
     async def async_analyze(
         self,
@@ -225,23 +213,28 @@ class FridgeVisionCoordinator:
         self._image_entity: Any | None = None
         self._unsubs: list[Callable[[], None]] = []
 
-        # Simple inventory sync properties
         self.inventory_entity_id: str = (
             entry.data.get(CONF_INVENTORY_ENTITY)
             or entry.options.get(CONF_INVENTORY_ENTITY)
             or ""
         )
         self._current_prompts: set[str] = set()
-        self._prompt_to_item: dict[str, str] = {}  # prompt -> item_name
+        self._prompt_to_item: dict[str, str] = {}
         self._debounce_unsub: Callable[[], None] | None = None
 
-        # State properties for entities in sensor.py
         self.last_detection_summary: str = "Brak detekcji"
         self.last_detection_failed: bool = False
         self.last_detection_details: dict[str, Any] = {}
 
     async def async_setup(self) -> None:
-        """Subscribe to door sensor, simple_inventory entity, and notifications."""
+        _LOGGER.info(
+            "=== Inicjalizacja Fridge Vision ===\n* Magazyn: %s\n* Kamera: %s\n* Drzwi: %s\n* Add-on URL: %s",
+            self.inventory_entity_id,
+            self.entry.data.get(CONF_CAMERA_ENTITY),
+            self.entry.data.get(CONF_DOOR_SENSOR_ENTITY),
+            self._client.base_url,
+        )
+
         self._unsubs.append(
             async_track_state_change_event(
                 self.hass,
@@ -255,7 +248,6 @@ class FridgeVisionCoordinator:
             )
         )
 
-        # Track simple_inventory sensor
         if self.inventory_entity_id:
             self._unsubs.append(
                 async_track_state_change_event(
@@ -264,33 +256,63 @@ class FridgeVisionCoordinator:
                     self._handle_inventory_changed,
                 )
             )
-            # Initial prompt extraction & model initialization
-            inv_state = self.hass.states.get(self.inventory_entity_id)
-            if inv_state:
-                self._process_inventory_state(inv_state, initial=True)
+            # Pobieramy produkty i inicjujemy prompty
+            self.hass.async_create_task(self._async_sync_and_reparameterize(force=True))
 
-    # ---------- simple_inventory Prompt Sync & Auto-Reparameterization ----------
+    def _get_inventory_id(self) -> str | None:
+        if not self.inventory_entity_id:
+            return None
+        state = self.hass.states.get(self.inventory_entity_id)
+        if state:
+            inv_id = state.attributes.get("inventory_id") or state.attributes.get("id")
+            if inv_id:
+                return str(inv_id)
+        return None
 
-    def _extract_prompts(
-        self, state: State
-    ) -> tuple[set[str], dict[str, str]]:
-        """Extract prompt -> item_name mapping from simple_inventory items attribute."""
-        items = state.attributes.get("items", [])
-        if isinstance(items, dict):
-            items = list(items.values())
-        elif not isinstance(items, list):
-            items = []
+    async def _async_fetch_items(self) -> list[dict[str, Any]]:
+        """Pobiera listę produktów z simple_inventory za pomocą usługi get_items."""
+        inv_id = self._get_inventory_id()
+        data: dict[str, Any] = {}
+        if inv_id:
+            data["inventory_id"] = inv_id
+        else:
+            state = self.hass.states.get(self.inventory_entity_id)
+            if state and state.name:
+                data["inventory_name"] = state.name
 
-        prompts: set[str] = set()
-        prompt_to_item: dict[str, str] = {}
+        _LOGGER.debug("[simple_inventory] Pobieram produkty przez service 'get_items' z danymi: %s", data)
+        try:
+            res = await self.hass.services.async_call(
+                "simple_inventory",
+                "get_items",
+                data,
+                blocking=True,
+                return_response=True,
+            )
+            if isinstance(res, dict):
+                items = res.get("items", [])
+                _LOGGER.info("[simple_inventory] Pomyślnie pobrano %d produktów z magazynu.", len(items))
+                return items
+        except Exception as err:
+            _LOGGER.error("[simple_inventory] Błąd podczas wywoływania get_items: %s", err)
+
+        # Fallback do atrybutów jeśli usługa nie zadziała
+        state = self.hass.states.get(self.inventory_entity_id)
+        if state and "items" in state.attributes:
+            items = state.attributes["items"]
+            return list(items.values()) if isinstance(items, dict) else items
+        return []
+
+    async def _async_sync_and_reparameterize(self, force: bool = False) -> bool:
+        """Pobiera produkty z magazynu, parsuje aliasy 'ai:' i wysyła do modelu."""
+        items = await self._async_fetch_items()
+        new_prompts: set[str] = set()
+        new_mapping: dict[str, str] = {}
 
         for item in items:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "")).strip()
-            if not name:
-                continue
-
             raw_aliases = item.get("aliases", [])
             aliases: list[str] = []
             if isinstance(raw_aliases, str):
@@ -302,89 +324,59 @@ class FridgeVisionCoordinator:
                 if alias.lower().startswith("ai:"):
                     prompt = alias[3:].strip()
                     if prompt:
-                        prompts.add(prompt)
-                        prompt_to_item[prompt] = name
+                        new_prompts.add(prompt)
+                        new_mapping[prompt] = name
 
-        return prompts, prompt_to_item
+        _LOGGER.info(
+            "[simple_inventory] Znalezione prompty AI: %s (mapowanie na produkty: %s)",
+            list(new_prompts),
+            new_mapping,
+        )
 
-    def _process_inventory_state(self, state: State, initial: bool = False) -> None:
-        """Check for prompt changes and trigger auto-reparameterization with debounce."""
-        new_prompts, new_mapping = self._extract_prompts(state)
-
-        if initial:
-            self._current_prompts = new_prompts
+        if not force and new_prompts == self._current_prompts:
             self._prompt_to_item = new_mapping
-            if new_prompts:
-                self._schedule_reparameterize()
-            return
+            _LOGGER.debug("[AI Reparameterize] Prompty się nie zmieniły, pomijam CLIP encoding.")
+            return True
 
-        if new_prompts != self._current_prompts:
-            _LOGGER.info(
-                "Detected change in 'ai:' prompts (%d -> %d). Scheduling re-parameterization...",
-                len(self._current_prompts),
-                len(new_prompts),
-            )
-            self._current_prompts = new_prompts
-            self._prompt_to_item = new_mapping
+        self._current_prompts = new_prompts
+        self._prompt_to_item = new_mapping
 
-            if self._debounce_unsub:
-                self._debounce_unsub()
-                self._debounce_unsub = None
+        if not new_prompts:
+            _LOGGER.warning("[AI Reparameterize] Brak promptów 'ai:' w magazynie! Dodaj do aliasu produktu np. 'ai: carton of milk'.")
+            return False
 
-            self._debounce_unsub = async_call_later(
-                self.hass, 3.0, self._async_debounced_reparameterize
-            )
-        else:
-            self._prompt_to_item = new_mapping
+        prompts_list = sorted(list(new_prompts))
+        _LOGGER.info("[AI Reparameterize] Wysyłam %d promptów do Add-ona AI...", len(prompts_list))
+        try:
+            await self._client.async_set_classes(prompts_list)
+            _LOGGER.info(" SUKCES: Model AI zreparametryzowany klasami: %s", prompts_list)
+            return True
+        except VisionApiError as err:
+            _LOGGER.error(" BŁĄD reparametryzacji modelu w Add-onie: %s", err)
+            return False
 
     @callback
     def _handle_inventory_changed(self, event: Event) -> None:
         new_state: State | None = event.data.get("new_state")
         if new_state is None or new_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             return
-        self._process_inventory_state(new_state)
-
-    @callback
-    def _async_debounced_reparameterize(self, _now: Any) -> None:
-        self._debounce_unsub = None
-        self._schedule_reparameterize()
-
-    def _schedule_reparameterize(self) -> None:
-        self._background_tasks = [t for t in self._background_tasks if not t.done()]
-        self._background_tasks.append(
-            self.hass.async_create_background_task(
-                self._async_reparameterize_best_effort(),
-                f"{DOMAIN}_reparameterize",
-            )
+        _LOGGER.info("[simple_inventory] Wykryto zmianę stanu sensora magazynu. Planuję synchronizację promptów...")
+        if self._debounce_unsub:
+            self._debounce_unsub()
+        self._debounce_unsub = async_call_later(
+            self.hass, 3.0, self._async_debounced_sync
         )
 
-    async def _async_reparameterize_best_effort(self) -> None:
-        try:
-            await self.async_reparameterize_model()
-        except VisionApiError as err:
-            _LOGGER.warning("Automatic re-parameterization failed: %s", err)
+    async def _async_debounced_sync(self, _now: Any) -> None:
+        self._debounce_unsub = None
+        await self._async_sync_and_reparameterize(force=False)
 
     async def async_reparameterize_model(self) -> bool:
-        """Send all AI prompts to the YOLO-World model via add-on."""
-        if not self._current_prompts and self.inventory_entity_id:
-            inv_state = self.hass.states.get(self.inventory_entity_id)
-            if inv_state:
-                self._current_prompts, self._prompt_to_item = self._extract_prompts(inv_state)
+        """Ręczne wywołanie usługi."""
+        _LOGGER.info("[Ręczne] Wymuszono reparametryzację modelu.")
+        return await self._async_sync_and_reparameterize(force=True)
 
-        prompts_list = sorted(list(self._current_prompts))
-        if not prompts_list:
-            _LOGGER.info("No AI prompts configured in simple_inventory (aliases starting with 'ai:')")
-            return False
-
-        await self._client.async_set_classes(prompts_list)
-        _LOGGER.info(
-            "Model successfully re-parameterized with %d prompt(s): %s",
-            len(prompts_list),
-            prompts_list,
-        )
-        return True
-
-    # ---------- Door Frame Capture Loop ----------
+    # ---------- Przechwytywanie klatek kamery ----------
 
     @callback
     def _handle_door_event(self, event: Event) -> None:
@@ -392,29 +384,30 @@ class FridgeVisionCoordinator:
         old_state: State | None = event.data.get("old_state")
         if new_state is None or new_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             return
-        if new_state.state == STATE_ON and (
-            old_state is None or old_state.state != STATE_ON
-        ):
-            _LOGGER.debug("Door opened - starting frame capture")
+
+        _LOGGER.info(
+            " Czujnik drzwi zmienił stan: %s -> %s",
+            old_state.state if old_state else "?",
+            new_state.state,
+        )
+
+        if new_state.state == STATE_ON and (old_state is None or old_state.state != STATE_ON):
+            _LOGGER.info(" DRZWI OTWARTE: Start nagrywania klatek z kamery %s...", self.entry.data[CONF_CAMERA_ENTITY])
             self._buffer.clear()
             if self._capture_task is None or self._capture_task.done():
-                self._capture_task = self.hass.async_create_task(
-                    self._async_capture_loop()
-                )
-        elif new_state.state == STATE_OFF and (
-            old_state is None or old_state.state != STATE_OFF
-        ):
-            _LOGGER.debug("Door closed - stopping capture and analyzing")
+                self._capture_task = self.hass.async_create_task(self._async_capture_loop())
+
+        elif new_state.state == STATE_OFF and (old_state is None or old_state.state != STATE_OFF):
+            _LOGGER.info(" DRZWI ZAMKNIĘTE: Zatrzymuję nagrywanie. Zebrano %d klatek.", len(self._buffer))
             if self._capture_task is not None:
                 self._capture_task.cancel()
                 self._capture_task = None
-            self._analysis_task = self.hass.async_create_task(
-                self._async_process_door_close()
-            )
+            self._analysis_task = self.hass.async_create_task(self._async_process_door_close())
 
     async def _async_capture_loop(self) -> None:
         fps = int(self.entry.data.get(CONF_CAPTURE_FPS, DEFAULT_CAPTURE_FPS))
         interval = 1.0 / max(1, fps)
+        frames_count = 0
         try:
             while True:
                 started = time.monotonic()
@@ -424,17 +417,20 @@ class FridgeVisionCoordinator:
                         self.entry.data[CONF_CAMERA_ENTITY],
                         timeout=CAPTURE_SNAPSHOT_TIMEOUT,
                     )
-                except (HomeAssistantError, asyncio.TimeoutError, aiohttp.ClientError) as err:
-                    _LOGGER.debug("Frame grab failed: %s", err)
+                except Exception as err:
+                    _LOGGER.warning(" Błąd pobierania klatki z kamery: %s", err)
                 else:
                     data = _extract_snapshot_bytes(snapshot)
                     if data:
                         self._buffer.append((dt_util.utcnow(), data))
                         self._trim_buffer()
+                        frames_count += 1
+                        if frames_count % 10 == 0:
+                            _LOGGER.debug("[Kamera] Przechwycono dotąd %d klatek...", frames_count)
                 elapsed = time.monotonic() - started
                 await asyncio.sleep(max(0.02, interval - elapsed))
         except asyncio.CancelledError:
-            raise
+            _LOGGER.debug("Pętla przechwytywania klatek anulowana.")
 
     def _trim_buffer(self) -> None:
         cutoff = dt_util.utcnow() - timedelta(seconds=BUFFER_SECONDS)
@@ -443,55 +439,49 @@ class FridgeVisionCoordinator:
         while len(self._buffer) > MAX_BUFFERED_FRAMES:
             self._buffer.popleft()
 
-    # ---------- Sequence Analysis & simple_inventory Calls ----------
+    # ---------- Analiza sekwencji ----------
 
     async def _async_process_door_close(self) -> None:
         buffer = list(self._buffer)
         self._buffer.clear()
         if len(buffer) < MIN_FRAMES_FOR_ANALYSIS:
-            _LOGGER.info(
-                "Door closed but fewer than %d frames captured; skipping analysis",
+            _LOGGER.warning(
+                " Zbyt mało klatek do analizy (%d klatek, minimum to %d). Pomijam analizę.",
+                len(buffer),
                 MIN_FRAMES_FOR_ANALYSIS,
             )
             return
 
         frames_b64 = [base64.b64encode(data).decode("ascii") for _, data in buffer]
-        _LOGGER.info("Analyzing door sequence with %d frame(s)", len(frames_b64))
+        threshold = float(self.entry.data.get(CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD))
+        vector_dir = str(self.entry.data[CONF_MOTION_VECTOR_INSERT_DIRECTION])
+
+        _LOGGER.info(
+            " Wysyłam %d klatek do Add-ona AI (próg pewności: %.2f, wektor: %s)...",
+            len(frames_b64),
+            threshold,
+            vector_dir,
+        )
 
         try:
-            result = await self._client.async_analyze(
-                frames_b64,
-                str(self.entry.data[CONF_MOTION_VECTOR_INSERT_DIRECTION]),
-                float(
-                    self.entry.data.get(
-                        CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD
-                    )
-                ),
-            )
+            result = await self._client.async_analyze(frames_b64, vector_dir, threshold)
+            _LOGGER.info(" Odpowiedź z Add-ona AI: %s", json.dumps(result, ensure_ascii=False))
         except VisionApiError as err:
-            _LOGGER.error("Vision AI analysis failed: %s", err)
+            _LOGGER.error(" Analiza sekwencji w Add-onie nie powiodła się: %s", err)
             self.last_detection_failed = True
             self.last_detection_summary = f"Błąd: {err}"
             self._notify_sensors_updated()
-            await self._async_report_analysis_error(str(err))
             return
 
         await self._async_apply_analysis(result)
 
     async def _async_apply_analysis(self, result: dict[str, Any]) -> None:
-        """Apply detections to simple_inventory and update entities."""
         annotated_b64 = result.get("annotated_image_base64")
         if annotated_b64 and self._image_entity is not None:
             with suppress(binascii.Error, ValueError):
-                self._image_entity.async_set_detection_image(
-                    base64.b64decode(annotated_b64)
-                )
+                self._image_entity.async_set_detection_image(base64.b64decode(annotated_b64))
 
-        threshold = float(
-            self.entry.data.get(
-                CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD
-            )
-        )
+        threshold = float(self.entry.data.get(CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD))
         detections = result.get("detections", [])
         self.last_detection_details = {
             "timestamp": dt_util.utcnow().isoformat(),
@@ -499,25 +489,31 @@ class FridgeVisionCoordinator:
         }
 
         if not detections:
+            _LOGGER.info(" Model AI nie wykrył żadnego ruchu produktów powyżej progu pewności.")
             self.last_detection_summary = "Brak ruchu"
             self.last_detection_failed = False
             self._notify_sensors_updated()
             return
 
-        inventory_id = self._get_inventory_id()
+        inv_id = self._get_inventory_id()
         detected_summaries: list[str] = []
         has_failure = False
 
         for detection in detections:
             action = str(detection.get("action", ""))
             prompt = str(detection.get("ai_prompt", "")).strip()
-            try:
-                confidence = float(detection.get("confidence", 0.0))
-            except (TypeError, ValueError):
-                confidence = 0.0
+            confidence = float(detection.get("confidence", 0.0))
+
+            _LOGGER.info(
+                "-> Detekcja: prompt='%s', akcja='%s', pewność=%.2f (próg: %.2f)",
+                prompt,
+                action,
+                confidence,
+                threshold,
+            )
 
             if confidence < threshold:
-                _LOGGER.debug("Ignoring detection %r below confidence threshold", prompt)
+                _LOGGER.info("   Pomijam detekcję (pewność %.2f poniżej progu %.2f)", confidence, threshold)
                 continue
 
             item_name = self._prompt_to_item.get(prompt)
@@ -525,153 +521,40 @@ class FridgeVisionCoordinator:
             if action in (DETECTION_INSERTED, DETECTION_REMOVED):
                 if not item_name:
                     has_failure = True
+                    _LOGGER.warning("   Wykryto prompt '%s', ale brak przypisanego produktu w simple_inventory!", prompt)
                     detected_summaries.append(f"Nieznany: {prompt}")
-                    await self._async_notify_unknown_item(prompt, action)
                 else:
                     service_name = "increment_item" if action == DETECTION_INSERTED else "decrement_item"
                     action_label = "Włożono" if action == DETECTION_INSERTED else "Wyjęto"
+                    _LOGGER.info("   SUKCES: %s -> %s. Wołam simple_inventory.%s", action_label, item_name, service_name)
                     detected_summaries.append(f"{item_name} ({action_label})")
-                    await self._async_call_simple_inventory(service_name, item_name, inventory_id)
+                    await self._async_call_simple_inventory(service_name, item_name, inv_id)
+
             elif action == DETECTION_AMBIGUOUS:
                 has_failure = True
+                _LOGGER.warning("   Ruch niejednoznaczny dla promptu '%s'", prompt)
                 detected_summaries.append(f"Niejednoznaczne: {item_name or prompt}")
-                await self._async_notify_ambiguous(item_name, prompt, inventory_id)
 
         self.last_detection_failed = has_failure
         self.last_detection_summary = ", ".join(detected_summaries) if detected_summaries else "Brak zmian"
         self._notify_sensors_updated()
 
-    def _get_inventory_id(self) -> str | None:
-        """Read inventory_id from simple_inventory sensor attributes if available."""
-        if not self.inventory_entity_id:
-            return None
-        state = self.hass.states.get(self.inventory_entity_id)
-        if state:
-            return state.attributes.get("inventory_id") or state.attributes.get("id")
-        return None
-
-    async def _async_call_simple_inventory(
-        self, service: str, item_name: str, inventory_id: str | None
-    ) -> None:
-        """Call simple_inventory increment_item or decrement_item."""
+    async def _async_call_simple_inventory(self, service: str, item_name: str, inventory_id: str | None) -> None:
         data: dict[str, Any] = {"name": item_name, "amount": 1}
         if inventory_id:
             data["inventory_id"] = inventory_id
-
         try:
+            _LOGGER.info("[simple_inventory] Wywołuję usługę %s z parametrami: %s", service, data)
             await self.hass.services.async_call("simple_inventory", service, data, blocking=True)
-            _LOGGER.info("Called simple_inventory.%s for %s", service, item_name)
         except Exception as err:
-            _LOGGER.error("Failed to update simple_inventory for %s: %s", item_name, err)
+            _LOGGER.error("[simple_inventory] Błąd podczas wywoływania usługi %s: %s", service, err)
             self.last_detection_failed = True
 
-    # ---------- Ambiguous & Actionable Notifications ----------
+    # ---------- Reszta pomocnicza ----------
 
     @callback
     def _handle_notification_action(self, event: Event) -> None:
-        data = event.data
-        action = data.get("action")
-        if action not in (ACTION_INSERT, ACTION_REMOVE, ACTION_IGNORE):
-            return
-        self.hass.async_create_task(
-            self._async_handle_notification_action(str(action), dict(data))
-        )
-
-    async def _async_handle_notification_action(
-        self, action: str, data: dict[str, Any]
-    ) -> None:
-        self._prune_pending()
-        tag = str(data.get("tag") or "")
-        pending = self._pending_ambiguous.pop(tag, None) if tag else None
-        item_name = data.get("item_name") or (pending or {}).get("item_name")
-        inventory_id = data.get("inventory_id") or (pending or {}).get("inventory_id")
-
-        if action == ACTION_IGNORE or not item_name:
-            return
-
-        service = "increment_item" if action == ACTION_INSERT else "decrement_item"
-        await self._async_call_simple_inventory(service, item_name, inventory_id)
-
-    def _prune_pending(self) -> None:
-        now = dt_util.utcnow()
-        expired = [
-            tag
-            for tag, payload in self._pending_ambiguous.items()
-            if payload["expires"] < now
-        ]
-        for tag in expired:
-            self._pending_ambiguous.pop(tag, None)
-
-    async def _async_notify(
-        self,
-        title: str,
-        message: str,
-        actions: list[dict[str, Any]] | None = None,
-        tag: str | None = None,
-    ) -> None:
-        target = str(self.entry.data.get(CONF_NOTIFY_DEVICE, "") or "").strip()
-        if not target:
-            return
-        target = target.replace("/", ".")
-        if "." not in target:
-            target = f"{NOTIFY_DOMAIN}.{target}"
-        domain, _, service = target.partition(".")
-        service_data: dict[str, Any] = {"title": title, "message": message}
-        if actions:
-            service_data["data"] = {"tag": tag, "actions": actions}
-        try:
-            await self.hass.services.async_call(
-                domain, service, service_data, blocking=True
-            )
-        except Exception as err:
-            _LOGGER.warning("Could not send notification via %s: %s", target, err)
-
-    async def _async_notify_ambiguous(
-        self, item_name: str | None, prompt: str, inventory_id: str | None
-    ) -> None:
-        if not item_name:
-            await self._async_notify_unknown_item(prompt, DETECTION_AMBIGUOUS)
-            return
-        tag = f"fridge_vision_{uuid.uuid4().hex[:8]}"
-        self._pending_ambiguous[tag] = {
-            "item_name": item_name,
-            "inventory_id": inventory_id,
-            "expires": dt_util.utcnow() + timedelta(minutes=PENDING_LIFETIME_MINUTES),
-        }
-        actions = [
-            {"action": ACTION_INSERT, "title": "Włożyłem", "item_name": item_name, "tag": tag},
-            {"action": ACTION_REMOVE, "title": "Wyjąłem", "item_name": item_name, "tag": tag},
-            {"action": ACTION_IGNORE, "title": "Ignoruj", "item_name": item_name, "tag": tag},
-        ]
-        await self._async_notify(
-            NOTIFICATION_TITLE_AMBIGUOUS,
-            f"Wykryto ruch dla {item_name}. Co zrobiłeś?",
-            actions=actions,
-            tag=tag,
-        )
-
-    async def _async_notify_unknown_item(self, prompt: str, action: str) -> None:
-        await self._async_notify(
-            NOTIFICATION_TITLE_UNKNOWN_ITEM,
-            f"Wykryto ruch ({action}) dla promptu \"{prompt}\", ale nie znaleziono produktu z tym promptem w simple_inventory.",
-        )
-
-    async def _async_report_analysis_error(self, message: str) -> None:
-        try:
-            await self.hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": "Fridge Vision: błąd analizy",
-                    "message": f"Nie udało się przeanalizować sekwencji: {message}",
-                    "notification_id": f"{DOMAIN}_analysis_error",
-                },
-                blocking=False,
-            )
-        except Exception as err:
-            _LOGGER.warning("Could not create persistent notification: %s", err)
-
-    # ---------- Entity Communication ----------
+        pass
 
     @callback
     def _notify_sensors_updated(self) -> None:
@@ -689,30 +572,11 @@ class FridgeVisionCoordinator:
     async def async_shutdown(self) -> None:
         if self._debounce_unsub:
             self._debounce_unsub()
-            self._debounce_unsub = None
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
-
-        tasks = [
-            t
-            for t in (
-                self._capture_task,
-                self._analysis_task,
-                *self._background_tasks,
-            )
-            if t is not None and not t.done()
-        ]
-        for t in tasks:
-            t.cancel()
-        for t in tasks:
-            with suppress(asyncio.CancelledError):
-                try:
-                    await t
-                except Exception as err:
-                    _LOGGER.debug("Background task error on shutdown: %s", err)
-
-        self._capture_task = None
-        self._analysis_task = None
-        self._background_tasks.clear()
+        if self._capture_task and not self._capture_task.done():
+            self._capture_task.cancel()
+        if self._analysis_task and not self._analysis_task.done():
+            self._analysis_task.cancel()
         await self._client.aclose()
