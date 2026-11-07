@@ -104,7 +104,17 @@ Since 1.2.0 the image also ships the `clip` package (Ultralytics CLIP
 fork, installed from a zip archive so no `git` is needed); without it
 every `set_classes` call fails with `ModuleNotFoundError: No module
 named 'clip'` and Ultralytics' pip AutoInstall fallback cannot repair
-itself inside the slim image.
+itself inside the slim image. Since 1.3.0 the server also runs uvicorn
+with `--timeout-keep-alive 75`, and the integration talks to it over
+per-request connections with automatic retries — together these remove
+the intermittent `[Errno 104] Connection reset by peer` that could
+abort an analysis right after a quiet period or an add-on restart.
+
+A normal restart is silent and graceful: uvicorn logs `INFO: Shutting
+down → Waiting for application shutdown → Application shutdown
+complete → Finished server process`, then the startup banner and
+`Fridge Vision AI ready (...)` reappear. Seeing those lines in the log
+is expected on every update or manual restart — they are not errors.
 
 ### 2. Integration (HACS)
 
@@ -313,6 +323,15 @@ curl http://homeassistant.local:8000/api/health
   (persistent; `YOLO_CONFIG_DIR` pins the Ultralytics settings there
   too). Offline installs log a warning and fetch the encoder on the
   first re-parameterization instead.
+- **`Connection reset by peer` (Errno 104) during analysis** — a pooled
+  HTTP connection was closed server-side between requests (uvicorn's
+  short keep-alive, or an add-on restart) and the next request raced
+  that close. Fixed since 1.3.0: the integration uses fresh
+  connections per request (`force_close`) and retries connection-level
+  failures twice (0.75 s / 2 s backoff) before surfacing an error;
+  the add-on keeps idle connections alive for 75 s. If it ever
+  reappears, check whether the add-on restarted at that exact moment
+  (its own log, not HA Core's) and whether the host was out of memory.
 - **Frames dropped** — snapshot failures are logged at debug level and
   skipped; the analysis simply uses the frames it got (min. 2 required).
 

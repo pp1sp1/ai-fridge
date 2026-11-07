@@ -232,7 +232,7 @@ def _run_pipeline(
 def create_app(vision_model: VisionModel | None = None) -> FastAPI:
     """Create the FastAPI application; ``vision_model`` allows test injection."""
     application = FastAPI(
-        title="Fridge Vision AI", version="1.0.0", lifespan=_lifespan
+        title="Fridge Vision AI", version="1.3.0", lifespan=_lifespan
     )
     application.state.model = vision_model if vision_model is not None else MODEL
     application.state.settings = SETTINGS

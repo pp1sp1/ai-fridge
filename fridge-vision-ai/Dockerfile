@@ -69,4 +69,9 @@ WORKDIR /data
 
 EXPOSE 8000
 
-CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/usr/src/fridge-vision-ai"]
+# --timeout-keep-alive 75: uvicorn's default of 5 s closes idle keep-alive
+# connections aggressively; a client that reuses such a pooled connection at
+# the wrong moment gets "[Errno 104] Connection reset by peer". 75 s keeps
+# idle sockets (Supervisor watchdog, curl, HA) alive far longer; the
+# integration additionally uses per-request connections (force_close).
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/usr/src/fridge-vision-ai", "--timeout-keep-alive", "75"]

@@ -9,7 +9,6 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     EntitySelector,
     EntitySelectorConfig,
@@ -101,11 +100,17 @@ class FridgeVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if notify and "." not in notify and "/" not in notify:
                 notify = f"{NOTIFY_DOMAIN}.{notify}"
 
-            client = VisionApiClient(async_get_clientsession(self.hass), url)
+            # Own force_close session (closed right after the probe): the
+            # shared HA session can hand back a pooled connection the
+            # add-on already closed, which would show a spurious
+            # cannot_connect during setup.
+            client = VisionApiClient(None, url)
             try:
                 await client.async_health()
             except VisionApiError:
                 errors["base"] = "cannot_connect"
+            finally:
+                await client.aclose()
 
             if not errors:
                 return self.async_create_entry(

@@ -36,7 +36,6 @@ from homeassistant.const import (
 )
 from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event
@@ -173,17 +172,60 @@ class VisionApiError(HomeAssistantError):
     """Raised when the Vision AI add-on cannot be reached or fails."""
 
 
-class VisionApiClient:
-    """Small aiohttp client for the Vision AI add-on REST API."""
+# Connection errors that mean "the request was most likely never
+# processed" and are safe to retry for this API: every endpoint here is
+# idempotent (health probe, set_classes, analyze_sequence). A retry
+# always opens a fresh connection, so a stale pooled socket can never
+# poison a second attempt.
+_RETRYABLE_ERRORS: tuple[type[Exception], ...] = (
+    aiohttp.ClientConnectorError,
+    aiohttp.ClientOSError,  # covers [Errno 104] Connection reset by peer
+    aiohttp.ServerDisconnectedError,
+)
+_RETRY_DELAYS: tuple[float, ...] = (0.75, 2.0)
 
-    def __init__(self, session: aiohttp.ClientSession, base_url: str) -> None:
+
+class VisionApiClient:
+    """Small aiohttp client for the Vision AI add-on REST API.
+
+    ``session`` may be ``None``: the client then owns a dedicated
+    ``ClientSession`` with keep-alive disabled (``force_close``). That is
+    deliberate — uvicorn closes idle keep-alive connections after a few
+    seconds, and reusing such a pooled connection races the server's
+    FIN, which surfaces as ``[Errno 104] Connection reset by peer`` on
+    the next call (typically the first analysis after a quiet period or
+    an add-on restart). Fresh connections per request cost nothing on
+    localhost and remove the race entirely; the retry loop below covers
+    the remaining restart windows.
+    """
+
+    def __init__(
+        self, session: aiohttp.ClientSession | None, base_url: str
+    ) -> None:
         self._session = session
+        self._owns_session = session is None
         self._base_url = base_url.rstrip("/")
 
     @property
     def base_url(self) -> str:
         """Base URL of the add-on API."""
         return self._base_url
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Return the injected session, or create the owned one lazily."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(force_close=True)
+            )
+            self._owns_session = True
+        return self._session
+
+    async def aclose(self) -> None:
+        """Close the owned session (no-op when one was injected)."""
+        if self._owns_session and self._session is not None:
+            if not self._session.closed:
+                await self._session.close()
+            self._session = None
 
     async def _request(
         self,
@@ -193,21 +235,45 @@ class VisionApiClient:
         timeout: float = HEALTH_TIMEOUT,
     ) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
-        try:
-            async with self._session.request(
-                method,
-                url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as response:
-                body = await response.text()
-                if response.status >= 400:
-                    raise VisionApiError(
-                        f"{method} {url} failed with HTTP {response.status}: "
-                        f"{body[:200]}"
+        session = self._get_session()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with session.request(
+                    method,
+                    url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise VisionApiError(
+                            f"{method} {url} failed with HTTP {response.status}: "
+                            f"{body[:200]}"
+                        )
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                # A real HTTP answer (any status) is never retried; only
+                # connection-level failures get another attempt.
+                if (
+                    isinstance(err, _RETRYABLE_ERRORS)
+                    and attempt <= len(_RETRY_DELAYS)
+                ):
+                    delay = _RETRY_DELAYS[attempt - 1]
+                    _LOGGER.warning(
+                        "%s %s failed (%s); retrying in %.1f s "
+                        "(attempt %d/%d)",
+                        method,
+                        url,
+                        err,
+                        delay,
+                        attempt + 1,
+                        len(_RETRY_DELAYS) + 1,
                     )
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            raise VisionApiError(f"{method} {url} failed: {err}") from err
+                    await asyncio.sleep(delay)
+                    continue
+                raise VisionApiError(f"{method} {url} failed: {err}") from err
+            break
         if not body:
             return {}
         try:
@@ -277,9 +343,9 @@ class FridgeVisionCoordinator:
         self.entry = entry
         self.items: dict[str, InventoryItem] = {}
         self._store = InventoryStore(hass)
-        self._client = VisionApiClient(
-            async_get_clientsession(hass), str(entry.data[CONF_AI_SERVICE_URL])
-        )
+        # session=None -> the client owns a dedicated force_close session
+        # (see VisionApiClient for why keep-alive must not be reused).
+        self._client = VisionApiClient(None, str(entry.data[CONF_AI_SERVICE_URL]))
         self._buffer: deque[tuple[datetime, bytes]] = deque()
         self._capture_task: asyncio.Task | None = None
         self._analysis_task: asyncio.Task | None = None
@@ -784,6 +850,7 @@ class FridgeVisionCoordinator:
         self._capture_task = None
         self._analysis_task = None
         self._background_tasks.clear()
+        await self._client.aclose()
         if self._dirty:
             await self._store.async_save(self.items)
             self._dirty = False
