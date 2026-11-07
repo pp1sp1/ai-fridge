@@ -3,8 +3,12 @@
 DOMAIN = "fridge_vision_inventory"
 
 # Storage (homeassistant.helpers.storage.Store).
+# v1: {"items": {id: {id, name, ai_prompt, quantity(int), location, last_updated}}}
+# v2: {"items": {...}, "history": [...]} - simple_inventory-style change
+# history. from_storage() is tolerant of both layouts, so old data
+# migrates automatically on first load.
 STORAGE_KEY = "fridge_vision_inventory_data"
-STORAGE_VERSION = 1
+STORAGE_VERSION = 2
 SAVE_DELAY = 5
 
 # Config entry keys.
@@ -56,15 +60,31 @@ PENDING_LIFETIME_MINUTES = 30
 
 NOTIFY_DOMAIN = "notify"
 
+# Change history (simple_inventory-style).
+DEFAULT_HISTORY_LIMIT = 50
+MAX_HISTORY_LIMIT = 500
+
+# HA events fired on inventory changes (for automations; mirrors
+# simple_inventory's event vocabulary).
+EVENT_ITEM_ADDED = f"{DOMAIN}_item_added"
+EVENT_ITEM_DELETED = f"{DOMAIN}_item_deleted"
+EVENT_ITEM_UPDATED = f"{DOMAIN}_item_updated"
+EVENT_ITEM_QUANTITY_CHANGED = f"{DOMAIN}_item_quantity_changed"
+
 # WebSocket API.
 WS_TYPE_ITEMS = f"{DOMAIN}/items"
 WS_TYPE_SUBSCRIBE_ITEMS = f"{DOMAIN}/subscribe_items"
+WS_TYPE_HISTORY = f"{DOMAIN}/history"
 
 # Services.
 SERVICE_ADD_ITEM = "add_item"
 SERVICE_UPDATE_ITEM = "update_item"
 SERVICE_UPDATE_QUANTITY = "update_quantity"
 SERVICE_DELETE_ITEM = "delete_item"
+SERVICE_INCREMENT_ITEM = "increment_item"
+SERVICE_DECREMENT_ITEM = "decrement_item"
+SERVICE_GET_HISTORY = "get_history"
+SERVICE_CLEAR_HISTORY = "clear_history"
 SERVICE_REPARAMETERIZE_MODEL = "reparameterize_model"
 
 # Item / attribute names.
@@ -72,3 +92,10 @@ ATTR_ITEM_ID = "item_id"
 ATTR_AI_PROMPT = "ai_prompt"
 ATTR_LOCATION = "location"
 ATTR_LAST_UPDATED = "last_updated"
+ATTR_QUANTITY = "quantity"
+ATTR_UNIT = "unit"
+ATTR_CATEGORY = "category"
+ATTR_EXPIRY_DATE = "expiry_date"
+ATTR_DESCRIPTION = "description"
+ATTR_AMOUNT = "amount"
+ATTR_NAME = "name"

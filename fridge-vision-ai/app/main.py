@@ -18,6 +18,8 @@ import binascii
 import json
 import logging
 import os
+import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,9 @@ from .model import (
     VisionModel,
 )
 from .tracker import (
+    ACTION_AMBIGUOUS,
+    ACTION_INSERTED,
+    ACTION_REMOVED,
     DEFAULT_MOTION_THRESHOLD,
     Detection,
     CentroidTracker,
@@ -177,6 +182,16 @@ def _run_pipeline(
     motion_threshold: float,
 ) -> tuple[list[DetectionOut], bytes]:
     """Decode, infer and track the whole sequence (runs in a worker thread)."""
+    started = time.perf_counter()
+    total = len(frames_base64)
+    LOGGER.info(
+        "Analysis started: %d frame(s), conf>=%.2f, motion>=%.1f%% of frame "
+        "height, direction=%s",
+        total,
+        confidence_threshold,
+        motion_threshold * 100.0,
+        vector_direction,
+    )
     tracker = CentroidTracker()
     frame_height: int | None = None
     for index, frame_b64 in enumerate(frames_base64):
@@ -191,6 +206,19 @@ def _run_pipeline(
         if frame_height is None:
             frame_height = height
         raw_boxes = model.infer(frame, confidence_threshold)
+        if raw_boxes:
+            boxes_summary = ", ".join(
+                f"'{box.prompt}' {box.confidence:.2f}" for box in raw_boxes
+            )
+            LOGGER.info(
+                "  frame %d/%d: %d detection(s): %s",
+                index + 1,
+                total,
+                len(raw_boxes),
+                boxes_summary,
+            )
+        else:
+            LOGGER.info("  frame %d/%d: no detections", index + 1, total)
         detections = [
             Detection(
                 frame_index=index,
@@ -205,6 +233,33 @@ def _run_pipeline(
     assert frame_height is not None
     track_results, best_index = analyze_tracks(
         tracker.tracks, vector_direction, motion_threshold, frame_height
+    )
+
+    for result in track_results:
+        LOGGER.info(
+            "  track #%d '%s': %s, best confidence %.2f, seen in %d frame(s), "
+            "dy=%+.1f px",
+            result.track_id,
+            result.ai_prompt,
+            result.action,
+            result.confidence,
+            result.track_length_frames,
+            result.delta_y,
+        )
+    action_counts = Counter(result.action for result in track_results)
+    LOGGER.info(
+        "Analysis done: %d track(s) -> %s=%d, %s=%d, %s=%d; best frame "
+        "%d/%d; took %.1f s",
+        len(track_results),
+        ACTION_INSERTED,
+        action_counts.get(ACTION_INSERTED, 0),
+        ACTION_REMOVED,
+        action_counts.get(ACTION_REMOVED, 0),
+        ACTION_AMBIGUOUS,
+        action_counts.get(ACTION_AMBIGUOUS, 0),
+        best_index + 1,
+        total,
+        time.perf_counter() - started,
     )
 
     try:
@@ -232,7 +287,7 @@ def _run_pipeline(
 def create_app(vision_model: VisionModel | None = None) -> FastAPI:
     """Create the FastAPI application; ``vision_model`` allows test injection."""
     application = FastAPI(
-        title="Fridge Vision AI", version="1.3.0", lifespan=_lifespan
+        title="Fridge Vision AI", version="1.3.1", lifespan=_lifespan
     )
     application.state.model = vision_model if vision_model is not None else MODEL
     application.state.settings = SETTINGS
@@ -264,6 +319,7 @@ def create_app(vision_model: VisionModel | None = None) -> FastAPI:
         """Re-parameterize the model with zero-shot text prompts."""
         model: VisionModel = request.app.state.model
         if not model.ready:
+            LOGGER.warning("set_classes rejected: model is still loading")
             raise HTTPException(
                 status_code=503, detail="model is still loading; retry shortly"
             )
@@ -288,6 +344,11 @@ def create_app(vision_model: VisionModel | None = None) -> FastAPI:
         total_bytes = sum(len(frame) for frame in payload.frames)
         if total_bytes > MAX_TOTAL_BASE64_BYTES:
             raise HTTPException(status_code=413, detail="frame payload too large")
+        LOGGER.info(
+            "analyze_sequence request: %d frame(s), %.1f MB payload",
+            len(payload.frames),
+            total_bytes / 1e6,
+        )
         try:
             detections, annotated = await asyncio.to_thread(
                 _run_pipeline,
@@ -298,8 +359,10 @@ def create_app(vision_model: VisionModel | None = None) -> FastAPI:
                 payload.motion_threshold,
             )
         except _FrameDecodeError as err:
+            LOGGER.warning("analyze_sequence: bad frame rejected: %s", err)
             raise HTTPException(status_code=400, detail=str(err)) from err
         except ModelNotLoadedError as err:
+            LOGGER.warning("analyze_sequence rejected: model is still loading")
             raise HTTPException(status_code=503, detail=str(err)) from err
         return AnalyzeResponse(
             detections=detections,

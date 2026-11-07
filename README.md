@@ -157,21 +157,32 @@ image_entity: image.fridge_last_detection
 ### Card
 
 The card mirrors the `simple-inventory-card` UX (without the barcode
-scanner — products are identified by their AI prompt instead):
+scanner — products are identified by their AI prompt instead). Since
+v3.0.0 the inventory uses the full simple_inventory-style data model:
+every item has a quantity, unit, category, location, expiry date and
+description, and every change is recorded in a history log.
 
 - **Visual editor (GUI only, no YAML)**: the card ships its own editor —
   add it via **+ Dodaj kartę → Fridge Inventory Card** and set the title,
   image entity (with `image.*` suggestions) and section toggles in the
   UI; Home Assistant stores the config for you.
+- **Tabs: Produkty | Historia** — the *Produkty* tab holds the item list;
+  the *Historia* tab shows the change log (newest first): what happened
+  (Dodano / Zwiększono / Zmniejszono / Edytowano / Usunięto), the amount,
+  the before → after quantities, a **Kamera / Ręcznie** source badge, the
+  detection detail (e.g. "INSERTED (pewność 0.87)") and a relative time.
+  The history can be refreshed or cleared (two-step confirmation) in the
+  tab.
 - **Rows with + / −** call `fridge_vision_inventory.update_quantity`
   (delta ±1); quantities update optimistically and then in real time via
   the `fridge_vision_inventory/subscribe_items` WebSocket push (60 s
-  polling fallback).
+  polling fallback). Decimals (e.g. 0.5 kg) are supported everywhere.
 - **+ Dodaj** opens the add dialog with *Nazwa produktu (PL)* — required,
-  *Prompt AI (EN)* — **required** (YOLO-World detection class, max 60
-  chars, live counter) and *Ilość* / *Lokalizacja* (with suggestions);
-  saving calls `fridge_vision_inventory.add_item` and shows
-  "Zapisuję… re-parametryzacja AI" while the model re-parameterizes.
+  *Prompt AI (EN)* — **optional** (empty prompt = manual-only item that
+  the camera never auto-detects), plus *Ilość*, *Jednostka*, *Kategoria*,
+  *Lokalizacja*, *Data ważności* and *Opis*; saving calls
+  `fridge_vision_inventory.add_item` (and shows "Zapisuję…
+  re-parametryzacja AI" when a prompt was set).
 - **Click a row** to edit it (same fields via
   `fridge_vision_inventory.update_item`; changing the prompt triggers a
   re-parameterization, and the prompt may also be cleared — the item then
@@ -193,17 +204,22 @@ scanner — products are identified by their AI prompt instead):
 ### Services
 
 ```yaml
-# Add a product (also re-parameterizes the model)
+# Add a product (prompt optional — empty = manual-only item; also
+# re-parameterizes the model when a prompt is set)
 service: fridge_vision_inventory.add_item
 data:
   name: "Mleko 3.2%"
   ai_prompt: "milk carton"
   quantity: 1
+  unit: "szt"
+  category: "Nabiał"
   location: "fridge"
+  expiry_date: "2026-12-24"
+  description: "Rodzajny"
 
-# Edit name / prompt / quantity / location (re-parameterizes on prompt change;
-# ai_prompt is optional here — an empty value clears the prompt and the item
-# stops being auto-detected)
+# Edit any fields (re-parameterizes on prompt change; ai_prompt is
+# optional here — an empty value clears the prompt and the item stops
+# being auto-detected)
 service: fridge_vision_inventory.update_item
 data:
   item_id: "<id>"
@@ -212,11 +228,30 @@ data:
   quantity: 2
   location: "fridge"
 
-# Manual correction
-service: fridge_vision_inventory.update_quantity
+# Manual correction (simple_inventory-style: works by name too)
+service: fridge_vision_inventory.increment_item
+data:
+  name: "Mleko 3.2%"
+  amount: 1
+service: fridge_vision_inventory.decrement_item
 data:
   item_id: "<id from the item sensor attributes>"
+  amount: 1
+
+# Legacy delta form (kept for backward compatibility)
+service: fridge_vision_inventory.update_quantity
+data:
+  item_id: "<id>"
   delta: -1
+
+# Change history (response_variable supported)
+service: fridge_vision_inventory.get_history
+data:
+  limit: 50
+response_variable: history
+
+# Wipe the recorded history
+service: fridge_vision_inventory.clear_history
 
 # Delete (also re-parameterizes)
 service: fridge_vision_inventory.delete_item
@@ -228,7 +263,38 @@ service: fridge_vision_inventory.reparameterize_model
 ```
 
 Each item also exposes a quantity sensor (`sensor.<nazwa>`) with the
-`item_id`, `ai_prompt`, `location` and `last_updated` attributes.
+`item_id`, `ai_prompt`, `location`, `unit`, `category`, `expiry_date`,
+`description` and `last_updated` attributes.
+
+#### Change history & events
+
+Every add, edit, delete, increment and decrement — whether it came from
+the camera (source `vision`, with the detection confidence in the
+detail) or from a service call / card button (source `manual`) — is
+recorded with `quantity_before` → `quantity_after`, an amount, a
+timestamp and the source. The history keeps the newest 500 events and
+survives restarts (storage v2; older v1 inventories migrate
+automatically on first load).
+
+For automations the integration fires HA events:
+`fridge_vision_inventory_item_added`, `..._item_deleted`,
+`..._item_updated` and `..._item_quantity_changed` — each payload
+carries `item_id`, `item_name`, `amount`, `quantity_before`,
+`quantity_after`, `source` (`vision` / `manual`) and `detail`.
+
+```yaml
+automation:
+  - triggers:
+      - trigger: event
+        event_type: fridge_vision_inventory_item_quantity_changed
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.event.data.source == 'vision' }}"
+    actions:
+      - action: notify.notify
+        data:
+          message: "Kamera: {{ trigger.event.data.item_name }} {{ trigger.event.data.quantity_before }} → {{ trigger.event.data.quantity_after }}"
+```
 
 ### Actionable notifications (AMBIGUOUS motions)
 
@@ -334,6 +400,17 @@ curl http://homeassistant.local:8000/api/health
   (its own log, not HA Core's) and whether the host was out of memory.
 - **Frames dropped** — snapshot failures are logged at debug level and
   skipped; the analysis simply uses the frames it got (min. 2 required).
+- **`WARNING ⚠️ 'half' is deprecated ... Use 'quantize' instead`** —
+  harmless. It came from passing `half=False` to every predict call under
+  Ultralytics ≥ 8.4, which deprecated the argument in favour of
+  `quantize` and warns on each call even when the value is `False`.
+  Fixed in 1.3.1 by dropping the argument; CPU inference was and stays
+  FP32, detection results are unchanged.
+- **`Could not initialize NNPACK! Reason: Unsupported hardware`** —
+  harmless, printed once per process by PyTorch when the CPU (some NAS
+  CPUs, VMs) lacks NNPACK support. PyTorch silently falls back to its
+  standard oneDNN kernels, which are at least as fast on modern x86.
+  No effect on detection quality; no configuration needed.
 
 ## Requirements
 

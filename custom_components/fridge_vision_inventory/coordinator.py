@@ -1,11 +1,14 @@
 """Data coordinator for Fridge Vision Inventory.
 
 Responsibilities:
-* persist and mutate the inventory (``Store``-backed),
+* persist and mutate the inventory (``Store``-backed, simple_inventory-
+  style items + change history, see ``inventory.py``),
 * grab camera frames at ~4 FPS while the door is open (max 30 s buffer),
 * post the buffered sequence to the Vision AI add-on on door close,
-* apply INSERTED / REMOVED actions to item quantities,
+* apply INSERTED / REMOVED actions to item quantities (recorded in the
+  change history with source="vision"),
 * dispatch actionable notifications for ambiguous movements,
+* fire ``fridge_vision_inventory_item_*`` events for automations,
 * re-parameterize the add-on model whenever items change.
 """
 
@@ -16,7 +19,6 @@ import base64
 import binascii
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
 import logging
@@ -63,6 +65,10 @@ from .const import (
     DETECTION_INSERTED,
     DETECTION_REMOVED,
     DOMAIN,
+    EVENT_ITEM_ADDED,
+    EVENT_ITEM_DELETED,
+    EVENT_ITEM_QUANTITY_CHANGED,
+    EVENT_ITEM_UPDATED,
     EVENT_NOTIFICATION_ACTION,
     HEALTH_TIMEOUT,
     MAX_BUFFERED_FRAMES,
@@ -77,95 +83,46 @@ from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
 )
+from .inventory import (
+    EVENT_INCREMENT,
+    SOURCE_MANUAL,
+    SOURCE_VISION,
+    InventoryItem,
+    InventoryState,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
-class InventoryItem:
-    """A single inventory entry persisted in the Store."""
-
-    id: str
-    name: str
-    ai_prompt: str
-    quantity: int
-    location: str
-    last_updated: str
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize for storage and WebSocket responses."""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "ai_prompt": self.ai_prompt,
-            "quantity": self.quantity,
-            "location": self.location,
-            "last_updated": self.last_updated,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> InventoryItem | None:
-        """Deserialize one stored entry; returns None when malformed."""
-        try:
-            item_id = str(payload["id"]).strip()
-            name = str(payload["name"]).strip()
-            # The AI prompt is optional on stored entries: an item without a
-            # prompt stays in the inventory but is not auto-detected until a
-            # prompt is set again.
-            ai_prompt = str(payload.get("ai_prompt", "")).strip()
-            if not item_id or not name:
-                return None
-            quantity = max(0, int(payload.get("quantity", 0)))
-            location = str(payload.get("location") or DEFAULT_LOCATION)
-            last_updated = str(
-                payload.get("last_updated") or dt_util.utcnow().isoformat()
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
-        return cls(
-            id=item_id,
-            name=name,
-            ai_prompt=ai_prompt,
-            quantity=quantity,
-            location=location,
-            last_updated=last_updated,
-        )
+# Historic v1 storage kept only these fields per item; inventory.py
+# migrates such payloads automatically (missing fields default to "").
 
 
 class InventoryStore:
-    """Store-backed persistence for inventory items."""
+    """Store-backed persistence for the inventory state (items + history)."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
 
-    async def async_load(self) -> dict[str, InventoryItem]:
-        """Load all items from storage."""
+    async def async_load(self) -> InventoryState:
+        """Load items and change history (tolerant of the v1 layout)."""
         raw = await self._store.async_load()
-        items: dict[str, InventoryItem] = {}
-        if not raw or not isinstance(raw.get("items"), dict):
-            return items
-        for key, payload in raw["items"].items():
-            item = InventoryItem.from_dict(payload)
-            if item is None:
-                _LOGGER.warning("Skipping malformed inventory entry %s", key)
-                continue
-            items[item.id] = item
-        return items
+        state = InventoryState.from_storage(raw)
+        if raw is not None and not isinstance(raw, dict):
+            _LOGGER.warning(
+                "Inventory storage payload has unexpected type %s; "
+                "starting with an empty inventory",
+                type(raw).__name__,
+            )
+        return state
 
-    def async_delay_save(self, items: dict[str, InventoryItem]) -> None:
-        """Schedule a debounced save of the current item map."""
-        self._store.async_delay_save(
-            lambda: {
-                item_id: item.to_dict() for item_id, item in items.items()
-            },
-            SAVE_DELAY,
-        )
+    def async_delay_save(self, state: InventoryState) -> None:
+        """Schedule a debounced save of the current state."""
+        self._store.async_delay_save(state.to_storage, SAVE_DELAY)
 
-    async def async_save(self, items: dict[str, InventoryItem]) -> None:
-        """Save the item map immediately (used on shutdown)."""
-        await self._store.async_save(
-            {item_id: item.to_dict() for item_id, item in items.items()}
-        )
+    async def async_save(self, state: InventoryState) -> None:
+        """Save the state immediately (used on shutdown)."""
+        await self._store.async_save(state.to_storage())
 
 
 class VisionApiError(HomeAssistantError):
@@ -341,7 +298,7 @@ class FridgeVisionCoordinator:
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
-        self.items: dict[str, InventoryItem] = {}
+        self.state = InventoryState()
         self._store = InventoryStore(hass)
         # session=None -> the client owns a dedicated force_close session
         # (see VisionApiClient for why keep-alive must not be reused).
@@ -355,10 +312,19 @@ class FridgeVisionCoordinator:
         self._unsubs: list[Callable[[], None]] = []
         self._dirty = False
 
+    @property
+    def items(self) -> dict[str, InventoryItem]:
+        """Live item map (id -> item), kept for entities and the WS API."""
+        return self.state.items
+
     async def async_setup(self) -> None:
         """Load stored items and subscribe to door + notification events."""
-        self.items = await self._store.async_load()
-        _LOGGER.info("Loaded %d inventory item(s)", len(self.items))
+        self.state = await self._store.async_load()
+        _LOGGER.info(
+            "Loaded %d inventory item(s) and %d history event(s)",
+            len(self.items),
+            len(self.state.history),
+        )
 
         self._unsubs.append(
             async_track_state_change_event(
@@ -478,7 +444,6 @@ class FridgeVisionCoordinator:
                 CONF_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD
             )
         )
-        changed = False
         for detection in result.get("detections", []):
             action = str(detection.get("action", ""))
             prompt = str(detection.get("ai_prompt", "")).strip()
@@ -491,34 +456,31 @@ class FridgeVisionCoordinator:
                     "Ignoring detection %r below confidence threshold", prompt
                 )
                 continue
-            item = self._find_item_by_prompt(prompt)
+            item = self.state.find_by_prompt(prompt)
             if action == DETECTION_INSERTED:
                 if item is None:
                     await self._async_notify_unknown_item(prompt, action)
                 else:
-                    item.quantity += 1
-                    self._touch(item)
-                    changed = True
-                    _LOGGER.info(
-                        "Inserted %s -> quantity %d", item.name, item.quantity
+                    await self._async_apply_quantity_change(
+                        item.id,
+                        1,
+                        source=SOURCE_VISION,
+                        detail=f"{DETECTION_INSERTED} (pewno\u015b\u0107 {confidence:.2f})",
                     )
             elif action == DETECTION_REMOVED:
                 if item is None:
                     await self._async_notify_unknown_item(prompt, action)
                 else:
-                    item.quantity = max(0, item.quantity - 1)
-                    self._touch(item)
-                    changed = True
-                    _LOGGER.info(
-                        "Removed %s -> quantity %d", item.name, item.quantity
+                    await self._async_apply_quantity_change(
+                        item.id,
+                        -1,
+                        source=SOURCE_VISION,
+                        detail=f"{DETECTION_REMOVED} (pewno\u015b\u0107 {confidence:.2f})",
                     )
             elif action == DETECTION_AMBIGUOUS:
                 await self._async_notify_ambiguous(item, prompt)
             else:
                 _LOGGER.debug("Ignoring unknown action %r", action)
-        if changed:
-            await self._async_schedule_save()
-            self._async_signal_items_updated()
 
     @callback
     def _handle_notification_action(self, event: Event) -> None:
@@ -566,16 +528,71 @@ class FridgeVisionCoordinator:
         for tag in expired:
             self._pending_ambiguous.pop(tag, None)
 
-    def _touch(self, item: InventoryItem) -> None:
-        item.last_updated = dt_util.utcnow().isoformat()
-
     async def _async_schedule_save(self) -> None:
         self._dirty = True
-        self._store.async_delay_save(self.items)
+        self._store.async_delay_save(self.state)
 
     @callback
     def _async_signal_items_updated(self) -> None:
         async_dispatcher_send(self.hass, SIGNAL_ITEMS_UPDATED)
+
+    # ---------- change bookkeeping (history + HA events) ----------
+
+    _EVENT_TYPE_MAP = {
+        "add": EVENT_ITEM_ADDED,
+        "delete": EVENT_ITEM_DELETED,
+        "update": EVENT_ITEM_UPDATED,
+        "increment": EVENT_ITEM_QUANTITY_CHANGED,
+        "decrement": EVENT_ITEM_QUANTITY_CHANGED,
+    }
+
+    @callback
+    def _fire_inventory_event(
+        self, event: Any, item: InventoryItem
+    ) -> None:
+        """Fire the HA event matching a recorded history change."""
+        ha_event = self._EVENT_TYPE_MAP.get(event.event_type)
+        if ha_event is None:
+            return
+        payload = event.to_dict()
+        payload["item_id"] = item.id
+        try:
+            self.hass.bus.async_fire(ha_event, payload)
+        except HomeAssistantError as err:
+            _LOGGER.debug("Could not fire %s: %s", ha_event, err)
+
+    async def _async_persist(self) -> None:
+        """Debounced save + real-time signal to entities and the card."""
+        await self._async_schedule_save()
+        self._async_signal_items_updated()
+
+    async def _async_apply_quantity_change(
+        self,
+        item_id: str,
+        delta: float,
+        *,
+        source: str,
+        detail: str = "",
+    ) -> InventoryItem:
+        """Apply one quantity change: history, HA event, save, signal."""
+        now = dt_util.utcnow().isoformat()
+        item, event = self.state.change_quantity(
+            item_id, delta, source=source, now=now, detail=detail
+        )
+        if event is None:
+            return item
+        await self._async_persist()
+        self._fire_inventory_event(event, item)
+        _LOGGER.info(
+            "%s %s: %s -> %s [%s]%s",
+            "Zwi\u0119kszono" if event.event_type == EVENT_INCREMENT else "Zmniejszono",
+            item.name,
+            event.quantity_before,
+            event.quantity_after,
+            event.source,
+            f" ({event.detail})" if event.detail else "",
+        )
+        return item
 
     async def _async_notify(
         self,
@@ -711,108 +728,174 @@ class FridgeVisionCoordinator:
     async def async_add_item(
         self,
         name: str,
-        ai_prompt: str,
-        quantity: int = 1,
+        ai_prompt: str = "",
+        quantity: float = 1.0,
         location: str = DEFAULT_LOCATION,
+        unit: str = "",
+        category: str = "",
+        expiry_date: str = "",
+        description: str = "",
     ) -> InventoryItem:
-        """Create an inventory item and re-parameterize the model."""
-        name_clean = str(name).strip()
-        prompt_clean = str(ai_prompt).strip()
-        if not name_clean:
-            raise HomeAssistantError("Item name must not be empty")
-        if not prompt_clean:
-            raise HomeAssistantError("AI prompt must not be empty")
-        item = InventoryItem(
-            id=uuid.uuid4().hex,
-            name=name_clean,
-            ai_prompt=prompt_clean,
-            quantity=max(0, int(quantity)),
-            location=str(location).strip() or DEFAULT_LOCATION,
-            last_updated=dt_util.utcnow().isoformat(),
+        """Create an inventory item and re-parameterize the model.
+
+        The AI prompt is optional: an item without one is stored but never
+        auto-detected by the vision model (simple_inventory-style manual
+        entry). Every creation is recorded in the change history.
+        """
+        now = dt_util.utcnow().isoformat()
+        try:
+            item, event = self.state.add_item(
+                name=name,
+                ai_prompt=ai_prompt,
+                quantity=quantity,
+                unit=unit,
+                category=category,
+                location=location,
+                expiry_date=expiry_date,
+                description=description,
+                now=now,
+            )
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        await self._async_persist()
+        self._fire_inventory_event(event, item)
+        _LOGGER.info(
+            "Added item %s (prompt: %s, qty: %s)",
+            item.name,
+            item.ai_prompt or "-",
+            event.amount,
         )
-        self.items[item.id] = item
-        await self._async_schedule_save()
-        self._async_signal_items_updated()
-        _LOGGER.info("Added item %s (prompt: %s)", item.name, item.ai_prompt)
-        self._schedule_reparameterize()
+        if item.ai_prompt:
+            self._schedule_reparameterize()
         return item
 
-    async def async_update_quantity(self, item_id: str, delta: int) -> InventoryItem:
+    async def async_update_quantity(self, item_id: str, delta: float) -> InventoryItem:
         """Increment or decrement an item quantity (clamped at zero)."""
-        item = self.items.get(item_id)
-        if item is None:
-            raise HomeAssistantError(f"Unknown item id: {item_id}")
-        item.quantity = max(0, item.quantity + int(delta))
-        self._touch(item)
-        await self._async_schedule_save()
-        self._async_signal_items_updated()
-        return item
+        return await self._async_apply_quantity_change(
+            item_id, delta, source=SOURCE_MANUAL
+        )
+
+    def _resolve_item(
+        self, item_id: str | None, name: str | None
+    ) -> InventoryItem:
+        """Find an item by id or (case-insensitive) display name."""
+        if item_id:
+            item = self.items.get(str(item_id))
+            if item is None:
+                raise HomeAssistantError(f"Unknown item id: {item_id}")
+            return item
+        if name and str(name).strip():
+            item = self.state.find_by_name(str(name))
+            if item is None:
+                raise HomeAssistantError(
+                    f"No inventory item named {name!r}"
+                )
+            return item
+        raise HomeAssistantError("Provide either item_id or name")
+
+    async def async_increment_item(
+        self,
+        amount: float = 1.0,
+        item_id: str | None = None,
+        name: str | None = None,
+    ) -> InventoryItem:
+        """Increase an item's quantity (by id or name) and record history."""
+        item = self._resolve_item(item_id, name)
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError) as err:
+            raise HomeAssistantError(f"Invalid amount: {amount!r}") from err
+        if amount <= 0:
+            raise HomeAssistantError("Amount must be greater than zero")
+        return await self._async_apply_quantity_change(item.id, amount, source=SOURCE_MANUAL)
+
+    async def async_decrement_item(
+        self,
+        amount: float = 1.0,
+        item_id: str | None = None,
+        name: str | None = None,
+    ) -> InventoryItem:
+        """Decrease an item's quantity (by id or name) and record history."""
+        item = self._resolve_item(item_id, name)
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError) as err:
+            raise HomeAssistantError(f"Invalid amount: {amount!r}") from err
+        if amount <= 0:
+            raise HomeAssistantError("Amount must be greater than zero")
+        return await self._async_apply_quantity_change(item.id, -amount, source=SOURCE_MANUAL)
+
+    def get_history(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Change history newest-first, optionally limited."""
+        return [event.to_dict() for event in self.state.recent_history(limit)]
+
+    async def async_clear_history(self) -> int:
+        """Drop all recorded history; returns the removed event count."""
+        removed = self.state.clear_history()
+        await self._async_persist()
+        _LOGGER.info("Cleared %d history event(s)", removed)
+        return removed
 
     async def async_update_item(
         self,
         item_id: str,
         name: str | None = None,
         ai_prompt: str | None = None,
-        quantity: int | None = None,
+        quantity: float | None = None,
         location: str | None = None,
+        unit: str | None = None,
+        category: str | None = None,
+        expiry_date: str | None = None,
+        description: str | None = None,
     ) -> InventoryItem:
         """Update item fields; re-parameterize when the AI prompt changes.
 
-        The AI prompt is mandatory when adding an item, but it can be cleared
-        while editing: an item without a prompt stays in the inventory and is
-        simply no longer auto-detected by the vision model.
+        The AI prompt is optional everywhere: an item without a prompt
+        stays in the inventory and is simply no longer auto-detected.
+        Every non-empty update is recorded in the change history.
         """
-        item = self.items.get(item_id)
-        if item is None:
-            raise HomeAssistantError(f"Unknown item id: {item_id}")
-        if name is None and ai_prompt is None and quantity is None and location is None:
-            raise HomeAssistantError("Provide at least one field to update")
-
-        if name is not None:
-            cleaned_name = str(name).strip()
-            if not cleaned_name:
-                raise HomeAssistantError("Item name must not be empty")
-            item.name = cleaned_name
-        if ai_prompt is not None:
-            # An empty prompt is allowed here: it clears the detection class
-            # and the item stops being auto-detected (it is kept in the
-            # inventory so the user can set a new prompt later).
-            cleaned_prompt = str(ai_prompt).strip()
-            if cleaned_prompt != item.ai_prompt:
-                item.ai_prompt = cleaned_prompt
-                self._touch(item)
-                self._schedule_reparameterize()
-        if quantity is not None:
-            item.quantity = max(0, int(quantity))
-        if location is not None:
-            item.location = str(location).strip() or DEFAULT_LOCATION
-        self._touch(item)
-        await self._async_schedule_save()
-        self._async_signal_items_updated()
+        now = dt_util.utcnow().isoformat()
+        try:
+            item, event = self.state.update_item(
+                item_id,
+                now=now,
+                name=name,
+                ai_prompt=ai_prompt,
+                quantity=quantity,
+                location=location,
+                unit=unit,
+                category=category,
+                expiry_date=expiry_date,
+                description=description,
+            )
+        except KeyError as err:
+            raise HomeAssistantError(str(err)) from err
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        if event is None:
+            return item
+        await self._async_persist()
+        self._fire_inventory_event(event, item)
+        _LOGGER.info("Updated item %s (%s)", item.name, event.detail)
+        if "ai_prompt" in (event.detail or ""):
+            self._schedule_reparameterize()
         return item
 
     async def async_delete_item(self, item_id: str) -> None:
         """Remove an inventory item and re-parameterize the model."""
-        item = self.items.pop(item_id, None)
-        if item is None:
-            raise HomeAssistantError(f"Unknown item id: {item_id}")
-        await self._async_schedule_save()
-        self._async_signal_items_updated()
+        now = dt_util.utcnow().isoformat()
+        try:
+            item, event = self.state.delete_item(item_id, now=now)
+        except KeyError as err:
+            raise HomeAssistantError(str(err)) from err
+        await self._async_persist()
+        self._fire_inventory_event(event, item)
         _LOGGER.info("Deleted item %s", item.name)
         self._schedule_reparameterize()
 
     def sorted_items(self) -> list[InventoryItem]:
         """Items sorted by display name (for the WebSocket API)."""
         return sorted(self.items.values(), key=lambda item: item.name.casefold())
-
-    def _find_item_by_prompt(self, prompt: str) -> InventoryItem | None:
-        wanted = prompt.strip().casefold()
-        if not wanted:
-            return None
-        for item in self.items.values():
-            if item.ai_prompt.strip().casefold() == wanted:
-                return item
-        return None
 
     @callback
     def register_image_entity(self, entity: Any) -> None:
@@ -852,5 +935,5 @@ class FridgeVisionCoordinator:
         self._background_tasks.clear()
         await self._client.aclose()
         if self._dirty:
-            await self._store.async_save(self.items)
+            await self._store.async_save(self.state)
             self._dirty = False

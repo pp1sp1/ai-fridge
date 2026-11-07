@@ -370,13 +370,20 @@ class VisionModel:
         with self._lock:
             if self._model is None:
                 raise ModelNotLoadedError("Model is not loaded yet")
+            # NOTE: deliberately no "half=" kwarg here. Ultralytics >= 8.4
+            # deprecated "half" in favour of "quantize" and logs a warning on
+            # EVERY predict call that passes it — even half=False. CPU
+            # inference is FP32 by default, which is exactly what we want.
+            infer_started = time.perf_counter()
             results = self._model.predict(
                 frame_bgr,
                 conf=confidence,
                 imgsz=self._image_size,
                 device=DEVICE,
                 verbose=False,
-                half=False,
+            )
+            LOGGER.debug(
+                "Inference took %.2f s", time.perf_counter() - infer_started
             )
         boxes: list[RawBox] = []
         if not results:

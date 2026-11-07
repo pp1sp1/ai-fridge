@@ -1,28 +1,34 @@
 /**
- * Fridge Inventory Card (v2)
+ * Fridge Inventory Card (v3)
  * Bundled Lovelace card for the Fridge Vision Inventory integration.
  *
- * UI modelled on blaineventurine/simple-inventory-card, scanner-free:
- * no barcode scanning and no Open Food Facts lookups — products are
- * identified by the YOLO-World "AI prompt" that is REQUIRED when adding
- * an item and OPTIONAL when editing (clearing it stops auto-detection).
+ * v3 follows blaineventurine/simple-inventory-card: items with quantities,
+ * units, categories, expiry dates and descriptions, plus/minus buttons on
+ * every row, and a dedicated change-history tab ("Historia") fed by the
+ * fridge_vision_inventory/history WebSocket command - every camera or
+ * manual change is listed with before/after quantities and its source.
  *
- * Features: header with total / out-of-stock badges, add & edit modals
- * (Polish UI), delete with confirm, live search, location & quantity
- * filters with badges, five sort modes with grouping, real-time updates
- * via fridge_vision_inventory/subscribe_items (polling fallback),
- * overflow menu with manual AI re-parameterization, toasts, and the
- * collapsible "last detection" panel with the annotated frame.
+ * Scanner-free: no barcode scanning and no Open Food Facts lookups -
+ * products are identified by the YOLO-World "AI prompt" that is OPTIONAL
+ * (empty prompt = manual-only item that is never auto-detected).
+ *
+ * Other features: header with total / out-of-stock badges, add & edit
+ * modals (Polish UI), delete with confirm, live search, location &
+ * quantity filters, five sort modes, real-time updates via
+ * fridge_vision_inventory/subscribe_items (polling fallback), overflow
+ * menu with manual AI re-parameterization, toasts, and the collapsible
+ * "last detection" panel with the annotated frame.
  *
  * The card is auto-injected by the integration (no Lovelace resource
  * setup needed) and ships with its own visual editor, so it can be added
- * and configured entirely from the Home Assistant UI — no YAML editing
+ * and configured entirely from the Home Assistant UI - no YAML editing
  * required.
  */
-const CARD_VERSION = "2.1.0";
+const CARD_VERSION = "3.0.0";
 const SERVICE_DOMAIN = "fridge_vision_inventory";
 const WS_ITEMS_TYPE = "fridge_vision_inventory/items";
 const WS_SUBSCRIBE_TYPE = "fridge_vision_inventory/subscribe_items";
+const WS_HISTORY_TYPE = "fridge_vision_inventory/history";
 
 const MAX_PROMPT_CHARS = 60; // mirrors the add-on's _MAX_PROMPT_CHARS
 const MAX_QUANTITY = 9999;
@@ -45,6 +51,12 @@ const esc = (value) =>
     '"': "&quot;",
     "'": "&#39;",
   })[ch]);
+
+const fmtQty = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "0";
+  return String(Number.isInteger(num) ? num : Math.round(num * 100) / 100);
+};
 
 const CARD_DEFAULT_TITLE = "Zapasy w lodówce";
 const CARD_DEFAULT_IMAGE_ENTITY = "image.fridge_last_detection";
@@ -127,6 +139,8 @@ class FridgeInventoryCard extends HTMLElement {
     this._menuOpen = false;
     this._deleteArmed = false;
     this._editing = null;
+    this._tab = "items";
+    this._history = [];
     this._documentClick = (event) => {
       if (!this._menuOpen) return;
       const path = event.composedPath ? event.composedPath() : [];
@@ -258,6 +272,7 @@ class FridgeInventoryCard extends HTMLElement {
             this._items = payload.items;
             this._lastError = null;
             this._renderItems();
+            if (this._tab === "history") this._refreshHistory();
           }
         },
         { type: WS_SUBSCRIBE_TYPE }
@@ -448,6 +463,42 @@ class FridgeInventoryCard extends HTMLElement {
       .meta .chip { overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
       .qty-wrap { display: flex; align-items: center; gap: 6px; }
       .qty { min-width: 2em; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .unit { font-size: 0.72rem; color: var(--secondary-text-color, #727272); margin-left: 2px; }
+      .tabs { display: flex; gap: 4px; margin: 2px 0 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
+      .tab {
+        flex: 1; border: none; background: transparent; font-family: inherit;
+        font-size: 0.92rem; font-weight: 600; color: var(--secondary-text-color, #727272);
+        padding: 8px 4px; cursor: pointer; border-bottom: 2px solid transparent;
+      }
+      .tab.active { color: var(--primary-color, #03a9f4); border-bottom-color: var(--primary-color, #03a9f4); }
+      .hist-actions { display: flex; gap: 8px; justify-content: flex-end; margin: 4px 0 8px; }
+      .hist-icon {
+        width: 30px; height: 30px; border-radius: 50%; flex: none;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-weight: 700; font-size: 1rem;
+      }
+      .hist-icon.inc { background: rgba(76, 175, 80, 0.18); color: var(--success-color, #4caf50); }
+      .hist-icon.dec { background: rgba(219, 68, 55, 0.15); color: var(--fvi-danger); }
+      .hist-icon.upd { background: var(--secondary-background-color, #f2f4f7); color: var(--secondary-text-color, #727272); }
+      .hist-head { display: flex; align-items: baseline; gap: 8px; }
+      .hist-what { font-weight: 500; }
+      .hist-delta { font-size: 0.8rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .hist-delta.inc { color: var(--success-color, #4caf50); }
+      .hist-delta.dec { color: var(--fvi-danger); }
+      .src-badge {
+        font-size: 0.66rem; font-weight: 700; border-radius: 999px; padding: 1px 7px;
+        background: var(--secondary-background-color, #f2f4f7);
+        color: var(--secondary-text-color, #727272); text-transform: uppercase; letter-spacing: 0.03em;
+      }
+      .src-badge.vision { background: rgba(3, 169, 244, 0.14); color: var(--primary-color, #03a9f4); }
+      .hist-sub { margin-top: 2px; }
+      .hist-detail { font-size: 0.74rem; color: var(--secondary-text-color, #727272); }
+      .dlg textarea {
+        padding: 9px 10px; border-radius: 8px; border: 1px solid var(--divider-color, #e0e0e0);
+        font-size: 0.95rem; font-family: inherit; resize: vertical; min-height: 54px;
+        background: var(--secondary-background-color, #f2f4f7);
+        color: var(--primary-text-color, #212121);
+      }
       .error {
         background: var(--fvi-danger); color: #fff; border-radius: 8px;
         padding: 8px 10px; margin: 8px 0 2px; font-size: 0.85rem;
@@ -500,12 +551,26 @@ class FridgeInventoryCard extends HTMLElement {
       <style>${style}</style>
       <ha-card>
         ${this._config.show_header ? this._headerHtml() : ""}
-        <div id="error" class="error" hidden></div>
-        ${this._toolbarHtml()}
-        <div class="filters" id="filterPanel" hidden></div>
-        <div class="chips" id="chips"></div>
-        <ul class="items" id="list"></ul>
-        <div class="empty" id="empty" hidden></div>
+        <div class="tabs" id="tabs">
+          <button class="tab active" data-tab="items" type="button">Produkty</button>
+          <button class="tab" data-tab="history" type="button">Historia</button>
+        </div>
+        <div id="itemsView">
+          <div id="error" class="error" hidden></div>
+          ${this._toolbarHtml()}
+          <div class="filters" id="filterPanel" hidden></div>
+          <div class="chips" id="chips"></div>
+          <ul class="items" id="list"></ul>
+          <div class="empty" id="empty" hidden></div>
+        </div>
+        <div id="historyView" hidden>
+          <div class="hist-actions">
+            <button class="btn secondary" id="histRefresh" type="button">Odśwież</button>
+            <button class="btn secondary" id="histClear" type="button">Wyczyść historię</button>
+          </div>
+          <ul class="items" id="historyList"></ul>
+          <div class="empty" id="historyEmpty" hidden>Brak zmian — historia zapisuje każde zdjęcie/odłożenie produktu (kamera i ręczne zmiany).</div>
+        </div>
         <details class="detection" id="detection" ${this._config.show_detection ? "" : "hidden"}>
           <summary>Ostatnie wykrycie</summary>
           <div class="det-body">
@@ -517,7 +582,7 @@ class FridgeInventoryCard extends HTMLElement {
       ${this._addDialogHtml()}
       ${this._editDialogHtml()}
       <div class="toast" id="toast"></div>
-    `;
+`;
     this._bindEvents();
     this._initialized = true;
     this._loadUiState();
@@ -575,17 +640,30 @@ class FridgeInventoryCard extends HTMLElement {
           <label><b>Nazwa produktu (PL) <span class="req">*</span></b>
             <input id="addName" type="text" required placeholder="Mleko 3.2%" />
           </label>
-          <label><b>Prompt AI (EN) <span class="req">*</span></b>
-            <input id="addPrompt" type="text" required placeholder="milk carton" maxlength="${MAX_PROMPT_CHARS}" />
-            <span class="helper">Wymagany — po angielsku, np. <i>milk carton, butter, cheese</i>. To klasa, po której YOLO-World rozpozna produkt.</span>
+          <label><b>Prompt AI (EN)</b>
+            <input id="addPrompt" type="text" placeholder="milk carton" maxlength="${MAX_PROMPT_CHARS}" />
+            <span class="helper">Opcjonalny — po angielsku, np. <i>milk carton, butter, cheese</i>. Bez promptu produkt jest tylko ręczny (kamera go nie rozpozna).</span>
             <span class="counter" id="addPromptCount">0/${MAX_PROMPT_CHARS}</span>
           </label>
           <label><b>Ilość</b>
-            <input id="addQty" type="number" min="0" max="${MAX_QUANTITY}" step="1" value="1" />
+            <input id="addQty" type="number" min="0" max="${MAX_QUANTITY}" step="0.5" value="1" />
+          </label>
+          <label><b>Jednostka</b>
+            <input id="addUnit" type="text" placeholder="szt, L, kg…" />
+          </label>
+          <label><b>Kategoria</b>
+            <input id="addCategory" type="text" list="catList" placeholder="Nabiał" />
+            <datalist id="catList"></datalist>
           </label>
           <label><b>Lokalizacja</b>
             <input id="addLocation" type="text" list="locList" placeholder="fridge" />
             <datalist id="locList"></datalist>
+          </label>
+          <label><b>Data ważności</b>
+            <input id="addExpiry" type="date" />
+          </label>
+          <label><b>Opis</b>
+            <textarea id="addDescription" placeholder="Opcjonalny opis…"></textarea>
           </label>
           <div class="dlg-error" id="addError"></div>
           <div class="dlg-actions">
@@ -611,10 +689,22 @@ class FridgeInventoryCard extends HTMLElement {
             <span class="counter" id="editPromptCount">0/${MAX_PROMPT_CHARS}</span>
           </label>
           <label><b>Ilość</b>
-            <input id="editQty" type="number" min="0" max="${MAX_QUANTITY}" step="1" />
+            <input id="editQty" type="number" min="0" max="${MAX_QUANTITY}" step="0.5" />
+          </label>
+          <label><b>Jednostka</b>
+            <input id="editUnit" type="text" placeholder="szt, L, kg…" />
+          </label>
+          <label><b>Kategoria</b>
+            <input id="editCategory" type="text" list="catList" />
           </label>
           <label><b>Lokalizacja</b>
             <input id="editLocation" type="text" list="locList" />
+          </label>
+          <label><b>Data ważności</b>
+            <input id="editExpiry" type="date" />
+          </label>
+          <label><b>Opis</b>
+            <textarea id="editDescription"></textarea>
           </label>
           <div class="dlg-meta" id="editMeta"></div>
           <div class="dlg-error" id="editError"></div>
@@ -631,6 +721,18 @@ class FridgeInventoryCard extends HTMLElement {
 
   _bindEvents() {
     const byId = (id) => this.shadowRoot.getElementById(id);
+
+    const tabs = byId("tabs");
+    if (tabs) {
+      tabs.addEventListener("click", (event) => {
+        const btn = event.target.closest("[data-tab]");
+        if (btn) this._switchTab(btn.dataset.tab);
+      });
+    }
+    const histRefresh = byId("histRefresh");
+    if (histRefresh) histRefresh.addEventListener("click", () => this._refreshHistory());
+    const histClear = byId("histClear");
+    if (histClear) histClear.addEventListener("click", () => this._clearHistory());
 
     const addBtn = byId("addBtn");
     if (addBtn) addBtn.addEventListener("click", () => this._openAddDialog());
@@ -915,22 +1017,26 @@ class FridgeInventoryCard extends HTMLElement {
   _buildRow(item) {
     const li = document.createElement("li");
     li.dataset.id = item.id || "";
-    if (!item.quantity) li.classList.add("empty-stock");
+    if (!(Number(item.quantity) > 0)) li.classList.add("empty-stock");
     const prompt = item.ai_prompt || "";
     const location = item.location || "";
+    const category = item.category || "";
+    const expiry = item.expiry_date || "";
     const updated = relativeTime(item.last_updated);
     li.innerHTML = `
       <div class="row-text">
         <div class="name" title="${esc(item.name)}">${esc(item.name)}</div>
         <div class="meta">
           ${prompt ? `<span class="chip prompt" title="Prompt AI: ${esc(prompt)}">${esc(prompt)}</span>` : `<span class="chip noprompt" title="Brak promptu AI — produkt nie jest automatycznie rozpoznawany">bez promptu AI</span>`}
+          ${category ? `<span class="chip" title="Kategoria: ${esc(category)}">${esc(category)}</span>` : ""}
           ${location ? `<span class="chip" title="Lokalizacja: ${esc(location)}">${esc(location)}</span>` : ""}
+          ${expiry ? `<span class="chip" title="Data ważności: ${esc(expiry)}">⏳ ${esc(expiry)}</span>` : ""}
           ${updated ? `<span class="chip chip-time">${esc(updated)}</span>` : ""}
         </div>
       </div>
       <div class="qty-wrap">
-        <button class="btn dec" type="button" aria-label="Zmniejsz ilość: ${esc(item.name)}" ${this._busy || !(item.quantity > 0) ? "disabled" : ""}>−</button>
-        <span class="qty">${esc(item.quantity)}</span>
+        <button class="btn dec" type="button" aria-label="Zmniejsz ilość: ${esc(item.name)}" ${this._busy || !(Number(item.quantity) > 0) ? "disabled" : ""}>−</button>
+        <span class="qty">${esc(fmtQty(item.quantity))}${item.unit ? `<span class="unit">${esc(item.unit)}</span>` : ""}</span>
         <button class="btn inc" type="button" aria-label="Zwiększ ilość: ${esc(item.name)}" ${this._busy ? "disabled" : ""}>+</button>
       </div>
     `;
@@ -1029,6 +1135,124 @@ class FridgeInventoryCard extends HTMLElement {
     panel.hidden = false;
   }
 
+  // ---------- Tabs / history ----------
+
+  _switchTab(tab) {
+    if (tab !== "items" && tab !== "history") return;
+    this._tab = tab;
+    const byId = (id) => this.shadowRoot.getElementById(id);
+    for (const btn of this.shadowRoot.querySelectorAll(".tab")) {
+      btn.classList.toggle("active", btn.dataset.tab === tab);
+    }
+    const itemsView = byId("itemsView");
+    const historyView = byId("historyView");
+    if (itemsView) itemsView.hidden = tab !== "items";
+    if (historyView) historyView.hidden = tab !== "history";
+    const detection = byId("detection");
+    if (detection) {
+      detection.hidden = tab !== "items" || !this._config.show_detection;
+    }
+    if (tab === "history") this._refreshHistory();
+  }
+
+  async _refreshHistory() {
+    if (!this._hass) return;
+    try {
+      const result = await this._hass.callWS({ type: WS_HISTORY_TYPE, limit: 100 });
+      this._history = Array.isArray(result && result.events) ? result.events : [];
+      this._lastError = null;
+    } catch (err) {
+      this._history = [];
+    }
+    this._renderHistory();
+  }
+
+  async _clearHistory() {
+    const btn = this.shadowRoot.getElementById("histClear");
+    if (btn && btn.dataset.armed !== "1") {
+      btn.dataset.armed = "1";
+      btn.textContent = "Na pewno wyczyścić?";
+      setTimeout(() => {
+        if (btn.isConnected) {
+          btn.dataset.armed = "";
+          btn.textContent = "Wyczyść historię";
+        }
+      }, 4000);
+      return;
+    }
+    if (btn) {
+      btn.dataset.armed = "";
+      btn.textContent = "Wyczyść historię";
+    }
+    try {
+      await this._hass.callService(SERVICE_DOMAIN, "clear_history", {});
+      this._toast("Historia wyczyszczona");
+    } catch (err) {
+      this._toast("Nie udało się wyczyścić historii", true);
+    }
+    this._refreshHistory();
+  }
+
+  _histRow(event) {
+    const li = document.createElement("li");
+    const type = String(event.event_type || "");
+    const isInc = type === "increment" || type === "add";
+    const isDec = type === "decrement" || type === "delete";
+    const iconClass = isInc ? "inc" : isDec ? "dec" : "upd";
+    const icon = type === "add" ? "+" : type === "delete" ? "×" : type === "update" ? "✎" : isInc ? "+" : "−";
+    const what =
+      type === "add"
+        ? "Dodano"
+        : type === "delete"
+          ? "Usunięto z listy"
+          : type === "update"
+            ? "Edytowano"
+            : type === "increment"
+              ? "Zwiększono"
+              : "Zmniejszono";
+    const deltaClass = isInc ? "inc" : isDec ? "dec" : "";
+    let deltaText = "";
+    if (type === "increment") deltaText = `+${fmtQty(event.amount)}`;
+    else if (type === "decrement") deltaText = `−${fmtQty(event.amount)}`;
+    else if (type === "add") deltaText = `${fmtQty(event.quantity_after ?? event.amount)}`;
+    else if (type === "delete") deltaText = `było ${fmtQty(event.quantity_before ?? 0)}`;
+    const source = String(event.source || "manual") === "vision" ? "Kamera" : "Ręcznie";
+    const before = event.quantity_before;
+    const after = event.quantity_after;
+    const transition =
+      before != null && after != null ? `${fmtQty(before)} → ${fmtQty(after)}` : "";
+    const detail = String(event.detail || "");
+    li.innerHTML = `
+      <span class="hist-icon ${iconClass}" aria-hidden="true">${icon}</span>
+      <div class="row-text">
+        <div class="hist-head">
+          <span class="hist-what">${esc(what)}: ${esc(event.item_name || "")}</span>
+          ${deltaText ? `<span class="hist-delta ${deltaClass}">${esc(deltaText)}</span>` : ""}
+        </div>
+        <div class="meta hist-sub">
+          <span class="src-badge ${String(event.source) === "vision" ? "vision" : ""}">${esc(source)}</span>
+          ${transition ? `<span class="chip">${esc(transition)}</span>` : ""}
+          ${relativeTime(event.timestamp) ? `<span class="chip chip-time">${esc(relativeTime(event.timestamp))}</span>` : ""}
+        </div>
+        ${detail ? `<div class="hist-detail">${esc(detail)}</div>` : ""}
+      </div>
+    `;
+    return li;
+  }
+
+  _renderHistory() {
+    const list = this.shadowRoot.getElementById("historyList");
+    const empty = this.shadowRoot.getElementById("historyEmpty");
+    if (!list || !empty) return;
+    list.innerHTML = "";
+    if (!this._history.length) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    for (const event of this._history) list.appendChild(this._histRow(event));
+  }
+
   // ---------- Add dialog ----------
 
   _openAddDialog() {
@@ -1036,10 +1260,14 @@ class FridgeInventoryCard extends HTMLElement {
     this.shadowRoot.getElementById("addName").value = "";
     this.shadowRoot.getElementById("addPrompt").value = "";
     this.shadowRoot.getElementById("addQty").value = "1";
+    this.shadowRoot.getElementById("addUnit").value = "";
+    this.shadowRoot.getElementById("addCategory").value = "";
     this.shadowRoot.getElementById("addLocation").value = "";
+    this.shadowRoot.getElementById("addExpiry").value = "";
+    this.shadowRoot.getElementById("addDescription").value = "";
     this.shadowRoot.getElementById("addError").textContent = "";
     this._updatePromptCounter("addPrompt", "addPromptCount");
-    this._fillLocationDatalist();
+    this._fillDatalists();
     this._clearInvalid("addForm");
     dialog.showModal();
     this.shadowRoot.getElementById("addName").focus();
@@ -1051,25 +1279,27 @@ class FridgeInventoryCard extends HTMLElement {
     const nameInput = this.shadowRoot.getElementById("addName");
     const promptInput = this.shadowRoot.getElementById("addPrompt");
     const qtyInput = this.shadowRoot.getElementById("addQty");
+    const unitInput = this.shadowRoot.getElementById("addUnit");
+    const categoryInput = this.shadowRoot.getElementById("addCategory");
     const locationInput = this.shadowRoot.getElementById("addLocation");
+    const expiryInput = this.shadowRoot.getElementById("addExpiry");
+    const descriptionInput = this.shadowRoot.getElementById("addDescription");
     const dlgError = this.shadowRoot.getElementById("addError");
     const saveBtn = this.shadowRoot.getElementById("addSave");
 
     const name = nameInput.value.trim();
     const aiPrompt = promptInput.value.trim();
     const quantity = this._parseQuantity(qtyInput.value);
+    const unit = unitInput.value.trim();
+    const category = categoryInput.value.trim();
     const location = locationInput.value.trim();
+    const expiryDate = expiryInput.value || "";
+    const description = descriptionInput.value.trim();
 
     this._clearInvalid("addForm");
     if (!name) {
       dlgError.textContent = "Podaj nazwę produktu (PL).";
       nameInput.classList.add("invalid");
-      return;
-    }
-    if (!aiPrompt) {
-      dlgError.textContent =
-        "Prompt AI (EN) jest wymagany — bez niego YOLO-World nie rozpozna produktu.";
-      promptInput.classList.add("invalid");
       return;
     }
     if (aiPrompt.length > MAX_PROMPT_CHARS) {
@@ -1080,13 +1310,17 @@ class FridgeInventoryCard extends HTMLElement {
 
     saveBtn.disabled = true;
     const originalLabel = saveBtn.textContent;
-    saveBtn.textContent = "Zapisuję… re-parametryzacja AI";
+    saveBtn.textContent = aiPrompt ? "Zapisuję… re-parametryzacja AI" : "Zapisuję…";
     try {
       await this._hass.callService(SERVICE_DOMAIN, "add_item", {
         name,
         ai_prompt: aiPrompt,
         quantity,
         location: location || undefined,
+        unit: unit || undefined,
+        category: category || undefined,
+        expiry_date: expiryDate || undefined,
+        description: description || undefined,
       });
       this._lastError = null;
       dialog.close();
@@ -1112,7 +1346,11 @@ class FridgeInventoryCard extends HTMLElement {
     this.shadowRoot.getElementById("editName").value = item.name || "";
     this.shadowRoot.getElementById("editPrompt").value = item.ai_prompt || "";
     this.shadowRoot.getElementById("editQty").value = String(Number(item.quantity) || 0);
+    this.shadowRoot.getElementById("editUnit").value = item.unit || "";
+    this.shadowRoot.getElementById("editCategory").value = item.category || "";
     this.shadowRoot.getElementById("editLocation").value = item.location || "";
+    this.shadowRoot.getElementById("editExpiry").value = item.expiry_date || "";
+    this.shadowRoot.getElementById("editDescription").value = item.description || "";
     this.shadowRoot.getElementById("editError").textContent = "";
     const shortId = String(item.id || "").slice(0, 8);
     this.shadowRoot.getElementById("editMeta").innerHTML =
@@ -1121,7 +1359,7 @@ class FridgeInventoryCard extends HTMLElement {
         ? ` · Zaktualizowano: ${esc(relativeTime(item.last_updated))}`
         : "");
     this._updatePromptCounter("editPrompt", "editPromptCount");
-    this._fillLocationDatalist();
+    this._fillDatalists();
     this._clearInvalid("editForm");
     dialog.showModal();
   }
@@ -1133,14 +1371,22 @@ class FridgeInventoryCard extends HTMLElement {
     const nameInput = this.shadowRoot.getElementById("editName");
     const promptInput = this.shadowRoot.getElementById("editPrompt");
     const qtyInput = this.shadowRoot.getElementById("editQty");
+    const unitInput = this.shadowRoot.getElementById("editUnit");
+    const categoryInput = this.shadowRoot.getElementById("editCategory");
     const locationInput = this.shadowRoot.getElementById("editLocation");
+    const expiryInput = this.shadowRoot.getElementById("editExpiry");
+    const descriptionInput = this.shadowRoot.getElementById("editDescription");
     const dlgError = this.shadowRoot.getElementById("editError");
     const saveBtn = this.shadowRoot.getElementById("editSave");
 
     const name = nameInput.value.trim();
     const aiPrompt = promptInput.value.trim();
     const quantity = this._parseQuantity(qtyInput.value);
+    const unit = unitInput.value.trim();
+    const category = categoryInput.value.trim();
     const location = locationInput.value.trim();
+    const expiryDate = expiryInput.value || "";
+    const description = descriptionInput.value.trim();
 
     this._clearInvalid("editForm");
     if (!name) {
@@ -1168,6 +1414,10 @@ class FridgeInventoryCard extends HTMLElement {
         ai_prompt: aiPrompt,
         quantity,
         location,
+        unit,
+        category,
+        expiry_date: expiryDate,
+        description,
       });
       this._lastError = null;
       this.shadowRoot.getElementById("editDialog").close();
@@ -1225,7 +1475,7 @@ class FridgeInventoryCard extends HTMLElement {
   // ---------- Helpers ----------
 
   _parseQuantity(raw) {
-    const parsed = parseInt(raw, 10);
+    const parsed = parseFloat(String(raw).replace(",", "."));
     if (!Number.isFinite(parsed) || parsed < 0) return 0;
     return Math.min(parsed, MAX_QUANTITY);
   }
@@ -1238,15 +1488,25 @@ class FridgeInventoryCard extends HTMLElement {
     }
   }
 
-  _fillLocationDatalist() {
-    const datalist = this.shadowRoot.getElementById("locList");
-    if (!datalist) return;
-    const locations = [...new Set(this._items.map((item) => item.location || ""))]
-      .filter(Boolean)
-      .sort();
-    datalist.innerHTML = locations
-      .map((location) => `<option value="${esc(location)}"></option>`)
-      .join("");
+  _fillDatalists() {
+    const locList = this.shadowRoot.getElementById("locList");
+    if (locList) {
+      const locations = [...new Set(this._items.map((item) => item.location || ""))]
+        .filter(Boolean)
+        .sort();
+      locList.innerHTML = locations
+        .map((location) => `<option value="${esc(location)}"></option>`)
+        .join("");
+    }
+    const catList = this.shadowRoot.getElementById("catList");
+    if (catList) {
+      const categories = [...new Set(this._items.map((item) => item.category || ""))]
+        .filter(Boolean)
+        .sort();
+      catList.innerHTML = categories
+        .map((category) => `<option value="${esc(category)}"></option>`)
+        .join("");
+    }
   }
 
   _clearInvalid(formId) {

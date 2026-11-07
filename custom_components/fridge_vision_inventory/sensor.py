@@ -18,9 +18,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ATTR_AI_PROMPT,
+    ATTR_CATEGORY,
+    ATTR_DESCRIPTION,
+    ATTR_EXPIRY_DATE,
     ATTR_ITEM_ID,
     ATTR_LAST_UPDATED,
     ATTR_LOCATION,
+    ATTR_UNIT,
     DOMAIN,
     SIGNAL_ITEMS_UPDATED,
 )
@@ -97,10 +101,13 @@ class FridgeItemSensor(SensorEntity):
         return item.name if item else None
 
     @property
-    def native_value(self) -> int | None:
-        """Current quantity of the item."""
+    def native_value(self) -> int | float | None:
+        """Current quantity of the item (int when whole)."""
         item = self.item
-        return item.quantity if item else None
+        if item is None:
+            return None
+        value = float(item.quantity)
+        return int(value) if value.is_integer() else value
 
     @property
     def available(self) -> bool:
@@ -109,7 +116,7 @@ class FridgeItemSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose item metadata."""
+        """Expose item metadata (simple_inventory-style fields)."""
         item = self.item
         if item is None:
             return {}
@@ -117,6 +124,10 @@ class FridgeItemSensor(SensorEntity):
             ATTR_ITEM_ID: item.id,
             ATTR_AI_PROMPT: item.ai_prompt,
             ATTR_LOCATION: item.location,
+            ATTR_UNIT: item.unit,
+            ATTR_CATEGORY: item.category,
+            ATTR_EXPIRY_DATE: item.expiry_date,
+            ATTR_DESCRIPTION: item.description,
             ATTR_LAST_UPDATED: item.last_updated,
         }
 
