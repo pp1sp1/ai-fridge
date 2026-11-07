@@ -58,9 +58,11 @@ NOTIFY_DOMAIN = "notify"
 
 # WebSocket API.
 WS_TYPE_ITEMS = f"{DOMAIN}/items"
+WS_TYPE_SUBSCRIBE_ITEMS = f"{DOMAIN}/subscribe_items"
 
 # Services.
 SERVICE_ADD_ITEM = "add_item"
+SERVICE_UPDATE_ITEM = "update_item"
 SERVICE_UPDATE_QUANTITY = "update_quantity"
 SERVICE_DELETE_ITEM = "delete_item"
 SERVICE_REPARAMETERIZE_MODEL = "reparameterize_model"

@@ -56,8 +56,9 @@ services are involved.
    quantities, and asks you via an actionable notification whenever a
    motion is ambiguous: *„Wykryto: Mleko 3.2%. Co zrobiłeś?"* with buttons
    **Włożyłem / Wyjąłem / Ignoruj**.
-5. The bundled card shows the product list with `+`/`−` counters, an
-   add-item dialog, and the last annotated detection image.
+5. The bundled card (modelled on `simple-inventory-card`, scanner-free)
+   shows the product list with `+`/`−` counters, add/edit/delete dialogs,
+   search, filters, sorting, and the last annotated detection image.
 
 ## Installation
 
@@ -111,18 +112,46 @@ and auto-injected with `add_extra_js_url`. Add the card to a dashboard:
 type: custom:fridge-inventory-card
 title: Zapasy w lodówce
 image_entity: image.fridge_last_detection
+# Optional display toggles (all default to true):
+# show_header: true
+# show_search: true
+# show_sort: true
+# show_filters: true
+# show_add_button: true
+# show_detection: true
 ```
 
 ## Usage
 
 ### Card
 
-- **+ / −** buttons on each row call
-  `fridge_vision_inventory.update_quantity` (delta ±1).
-- **+ Dodaj produkt** opens the dialog with *Nazwa produktu (PL)*,
-  *Prompt AI (EN)* and *Ilość*; saving calls
-  `fridge_vision_inventory.add_item` and shows a loading state while the
-  model re-parameterizes.
+The card mirrors the `simple-inventory-card` UX (without the barcode
+scanner — products are identified by their AI prompt instead):
+
+- **Rows with + / −** call `fridge_vision_inventory.update_quantity`
+  (delta ±1); quantities update optimistically and then in real time via
+  the `fridge_vision_inventory/subscribe_items` WebSocket push (60 s
+  polling fallback).
+- **+ Dodaj** opens the add dialog with *Nazwa produktu (PL)* — required,
+  *Prompt AI (EN)* — **required** (YOLO-World detection class, max 60
+  chars, live counter) and *Ilość* / *Lokalizacja* (with suggestions);
+  saving calls `fridge_vision_inventory.add_item` and shows
+  "Zapisuję… re-parametryzacja AI" while the model re-parameterizes.
+- **Click a row** to edit it (same fields via
+  `fridge_vision_inventory.update_item`; changing the prompt triggers a
+  re-parameterization, and the prompt may also be cleared — the item then
+  stays in the inventory but is no longer auto-detected, shown as
+  "bez promptu AI") or delete it (two-step "Na pewno usunąć?"
+  confirmation).
+- **Search** (debounced) across names, AI prompts and locations.
+- **Filters** (funnel icon): multi-select locations, quantity
+  (all / zero / available); active filters appear as removable chips and
+  persist per card in browser storage.
+- **Sorting**: Nazwa A–Z, Ilość malejąco / rosnąco, Lokalizacja (grouped
+  with headers), Puste na końcu.
+- **Header badges**: total quantity and a red "Brakuje: N" count of
+  out-of-stock items; the **⋮** menu offers list refresh and a manual
+  "Re-parametryzacja AI" action.
 - **Ostatnie wykrycie** is a collapsible panel showing the annotated
   image from `image.fridge_last_detection` (boxes + motion arrows).
 
@@ -135,6 +164,17 @@ data:
   name: "Mleko 3.2%"
   ai_prompt: "milk carton"
   quantity: 1
+  location: "fridge"
+
+# Edit name / prompt / quantity / location (re-parameterizes on prompt change;
+# ai_prompt is optional here — an empty value clears the prompt and the item
+# stops being auto-detected)
+service: fridge_vision_inventory.update_item
+data:
+  item_id: "<id>"
+  name: "Mleko 3.2%"
+  ai_prompt: "milk carton"
+  quantity: 2
   location: "fridge"
 
 # Manual correction

@@ -110,8 +110,11 @@ class InventoryItem:
         try:
             item_id = str(payload["id"]).strip()
             name = str(payload["name"]).strip()
-            ai_prompt = str(payload["ai_prompt"]).strip()
-            if not item_id or not name or not ai_prompt:
+            # The AI prompt is optional on stored entries: an item without a
+            # prompt stays in the inventory but is not auto-detected until a
+            # prompt is set again.
+            ai_prompt = str(payload.get("ai_prompt", "")).strip()
+            if not item_id or not name:
                 return None
             quantity = max(0, int(payload.get("quantity", 0)))
             location = str(payload.get("location") or DEFAULT_LOCATION)
@@ -679,6 +682,49 @@ class FridgeVisionCoordinator:
         self._async_signal_items_updated()
         return item
 
+    async def async_update_item(
+        self,
+        item_id: str,
+        name: str | None = None,
+        ai_prompt: str | None = None,
+        quantity: int | None = None,
+        location: str | None = None,
+    ) -> InventoryItem:
+        """Update item fields; re-parameterize when the AI prompt changes.
+
+        The AI prompt is mandatory when adding an item, but it can be cleared
+        while editing: an item without a prompt stays in the inventory and is
+        simply no longer auto-detected by the vision model.
+        """
+        item = self.items.get(item_id)
+        if item is None:
+            raise HomeAssistantError(f"Unknown item id: {item_id}")
+        if name is None and ai_prompt is None and quantity is None and location is None:
+            raise HomeAssistantError("Provide at least one field to update")
+
+        if name is not None:
+            cleaned_name = str(name).strip()
+            if not cleaned_name:
+                raise HomeAssistantError("Item name must not be empty")
+            item.name = cleaned_name
+        if ai_prompt is not None:
+            # An empty prompt is allowed here: it clears the detection class
+            # and the item stops being auto-detected (it is kept in the
+            # inventory so the user can set a new prompt later).
+            cleaned_prompt = str(ai_prompt).strip()
+            if cleaned_prompt != item.ai_prompt:
+                item.ai_prompt = cleaned_prompt
+                self._touch(item)
+                self._schedule_reparameterize()
+        if quantity is not None:
+            item.quantity = max(0, int(quantity))
+        if location is not None:
+            item.location = str(location).strip() or DEFAULT_LOCATION
+        self._touch(item)
+        await self._async_schedule_save()
+        self._async_signal_items_updated()
+        return item
+
     async def async_delete_item(self, item_id: str) -> None:
         """Remove an inventory item and re-parameterize the model."""
         item = self.items.pop(item_id, None)
@@ -695,6 +741,8 @@ class FridgeVisionCoordinator:
 
     def _find_item_by_prompt(self, prompt: str) -> InventoryItem | None:
         wanted = prompt.strip().casefold()
+        if not wanted:
+            return None
         for item in self.items.values():
             if item.ai_prompt.strip().casefold() == wanted:
                 return item

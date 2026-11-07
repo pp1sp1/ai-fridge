@@ -61,6 +61,32 @@
         }
       }
     },
+    "update_item": {
+      "name": "Update item",
+      "description": "Updates name, AI prompt, quantity or location of an inventory item. Changing the AI prompt triggers a model re-parameterization. The prompt is required when adding an item, but it can be cleared while editing; an item without a prompt is kept in the inventory and simply stops being auto-detected.",
+      "fields": {
+        "item_id": {
+          "name": "Item ID",
+          "description": "ID of the inventory item to update."
+        },
+        "name": {
+          "name": "Name",
+          "description": "New display name of the product."
+        },
+        "ai_prompt": {
+          "name": "AI prompt",
+          "description": "New English detection prompt for YOLO-World, e.g. \"milk carton\". Optional: set an empty value to clear the prompt; the item is then no longer auto-detected."
+        },
+        "quantity": {
+          "name": "Quantity",
+          "description": "New quantity (0 or more)."
+        },
+        "location": {
+          "name": "Location",
+          "description": "New storage location of the item."
+        }
+      }
+    },
     "update_quantity": {
       "name": "Update quantity",
       "description": "Increments or decrements the quantity of an inventory item.",

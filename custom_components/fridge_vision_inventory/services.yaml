@@ -36,6 +36,53 @@ add_item:
       example: "fridge"
       selector:
         text:
+update_item:
+  name: Update item
+  description: >
+    Updates name, AI prompt, quantity or location of an inventory item.
+    Changing the AI prompt triggers a model re-parameterization. The prompt
+    is required when adding an item, but it can be cleared while editing;
+    an item without a prompt is kept in the inventory and simply stops
+    being auto-detected.
+  fields:
+    item_id:
+      name: Item ID
+      description: ID of the inventory item to update.
+      required: true
+      example: "6f0d3a1e8c2b4f6e9d7a1b2c3d4e5f60"
+      selector:
+        text:
+    name:
+      name: Name
+      description: New display name of the product, e.g. "Mleko 3.2%".
+      example: "Mleko 3.2%"
+      selector:
+        text:
+    ai_prompt:
+      name: AI prompt
+      description: >
+        New English detection prompt for YOLO-World, e.g. "milk carton".
+        Optional here: set an empty value to clear the prompt; the item is
+        then no longer auto-detected.
+      example: "milk carton"
+      selector:
+        text:
+    quantity:
+      name: Quantity
+      description: New quantity (0 or more).
+      example: 2
+      selector:
+        number:
+          min: 0
+          max: 9999
+          step: 1
+          mode: box
+    location:
+      name: Location
+      description: New storage location of the item.
+      example: "fridge"
+      selector:
+        text:
 update_quantity:
   name: Update quantity
   description: Increments or decrements the quantity of an inventory item.

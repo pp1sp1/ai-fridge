@@ -61,6 +61,32 @@
         }
       }
     },
+    "update_item": {
+      "name": "Aktualizuj produkt",
+      "description": "Aktualizuje nazwę, prompt AI, ilość lub lokalizację produktu w inwentarzu. Zmiana promptu AI wywołuje re-parametryzację modelu. Prompt jest wymagany przy dodawaniu produktu, ale można go wyczyścić podczas edycji — produkt bez promptu pozostaje na liście i przestaje być automatycznie rozpoznawany.",
+      "fields": {
+        "item_id": {
+          "name": "ID produktu",
+          "description": "Identyfikator produktu do zaktualizowania."
+        },
+        "name": {
+          "name": "Nazwa",
+          "description": "Nowa nazwa wyświetlana produktu."
+        },
+        "ai_prompt": {
+          "name": "Prompt AI",
+          "description": "Nowy angielski prompt detekcji dla YOLO-World, np. \"milk carton\". Opcjonalne: pusta wartość czyści prompt — produkt przestaje być automatycznie rozpoznawany."
+        },
+        "quantity": {
+          "name": "Ilość",
+          "description": "Nowa ilość (0 lub więcej)."
+        },
+        "location": {
+          "name": "Lokalizacja",
+          "description": "Nowe miejsce przechowywania produktu."
+        }
+      }
+    },
     "update_quantity": {
       "name": "Zmień ilość",
       "description": "Zwiększa lub zmniejsza ilość produktu w inwentarzu.",

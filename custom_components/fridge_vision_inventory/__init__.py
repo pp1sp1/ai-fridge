@@ -22,6 +22,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import (
     DEFAULT_LOCATION,
@@ -29,8 +30,11 @@ from .const import (
     SERVICE_ADD_ITEM,
     SERVICE_DELETE_ITEM,
     SERVICE_REPARAMETERIZE_MODEL,
+    SERVICE_UPDATE_ITEM,
     SERVICE_UPDATE_QUANTITY,
+    SIGNAL_ITEMS_UPDATED,
     WS_TYPE_ITEMS,
+    WS_TYPE_SUBSCRIBE_ITEMS,
 )
 from .coordinator import FridgeVisionCoordinator, VisionApiError
 
@@ -54,6 +58,17 @@ SERVICE_SCHEMAS: dict[str, vol.Schema] = {
                 vol.Coerce(int), vol.Range(min=0, max=9999)
             ),
             vol.Optional("location", default=DEFAULT_LOCATION): cv.string,
+        }
+    ),
+    SERVICE_UPDATE_ITEM: vol.Schema(
+        {
+            vol.Required("item_id"): cv.string,
+            vol.Optional("name"): cv.string,
+            vol.Optional("ai_prompt"): cv.string,
+            vol.Optional("quantity"): vol.All(
+                vol.Coerce(int), vol.Range(min=0, max=9999)
+            ),
+            vol.Optional("location"): cv.string,
         }
     ),
     SERVICE_UPDATE_QUANTITY: vol.Schema(
@@ -123,6 +138,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
             location=call.data["location"],
         )
 
+    async def _async_handle_update_item(call: ServiceCall) -> None:
+        await _require_coordinator(hass).async_update_item(
+            call.data["item_id"],
+            name=call.data.get("name"),
+            ai_prompt=call.data.get("ai_prompt"),
+            quantity=call.data.get("quantity"),
+            location=call.data.get("location"),
+        )
+
     async def _async_handle_update_quantity(call: ServiceCall) -> None:
         await _require_coordinator(hass).async_update_quantity(
             call.data["item_id"], call.data["delta"]
@@ -149,6 +173,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_ADD_ITEM,
         _async_handle_add_item,
         schema=SERVICE_SCHEMAS[SERVICE_ADD_ITEM],
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPDATE_ITEM,
+        _async_handle_update_item,
+        schema=SERVICE_SCHEMAS[SERVICE_UPDATE_ITEM],
     )
     hass.services.async_register(
         DOMAIN,
@@ -195,7 +225,47 @@ def _async_register_websocket_api(hass: HomeAssistant) -> None:
         )
 
     websocket_api.async_register_command(hass, ws_get_items)
-    _LOGGER.debug("WebSocket API registered (%s)", WS_TYPE_ITEMS)
+
+    @websocket_api.websocket_command(
+        {vol.Required("type"): WS_TYPE_SUBSCRIBE_ITEMS}
+    )
+    @callback
+    def ws_subscribe_items(
+        hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        """Push the item list on every inventory change (real-time card)."""
+        coordinator = _get_coordinator(hass)
+        if coordinator is None:
+            connection.send_error(
+                msg["id"], "not_ready", "Fridge Vision Inventory is not set up"
+            )
+            return
+
+        @callback
+        def _push_items() -> None:
+            connection.send_message(
+                websocket_api.event_message(
+                    msg["id"],
+                    {
+                        "items": [
+                            item.to_dict() for item in coordinator.sorted_items()
+                        ]
+                    },
+                )
+            )
+
+        connection.subscriptions[msg["id"]] = async_dispatcher_connect(
+            hass, SIGNAL_ITEMS_UPDATED, _push_items
+        )
+        connection.send_result(
+            msg["id"],
+            {"items": [item.to_dict() for item in coordinator.sorted_items()]},
+        )
+
+    websocket_api.async_register_command(hass, ws_subscribe_items)
+    _LOGGER.debug(
+        "WebSocket API registered (%s, %s)", WS_TYPE_ITEMS, WS_TYPE_SUBSCRIBE_ITEMS
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -227,6 +297,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not hass.data.get(DOMAIN):
         for service in (
             SERVICE_ADD_ITEM,
+            SERVICE_UPDATE_ITEM,
             SERVICE_UPDATE_QUANTITY,
             SERVICE_DELETE_ITEM,
             SERVICE_REPARAMETERIZE_MODEL,
