@@ -73,6 +73,11 @@ services are involved.
    first start into the persistent `/data` volume (~26 MB for
    `yolov8s-worldv2.pt`, ~57 MB for `yolov8m-worldv2.pt`) — internet
    access is required once in that case.
+4. Zero-shot prompts additionally need the CLIP ViT-B/32 text encoder
+   (~354 MB). The `clip` package (Ultralytics CLIP fork) is baked into
+   the image; the encoder weights are pre-downloaded **once** at first
+   start into the persistent `/data/weights/clip` folder and survive
+   restarts and add-on updates.
 
 Options (add-on page → Configuration):
 
@@ -95,6 +100,11 @@ startup). If the Supervisor reports incompatible/invalid configuration
 after the update, open the add-on **Configuration** tab, set *Model* to
 `yolov8s-worldv2.pt` and save — the app itself also falls back to the
 `s` model with a log warning if it ever receives an unsupported name.
+Since 1.2.0 the image also ships the `clip` package (Ultralytics CLIP
+fork, installed from a zip archive so no `git` is needed); without it
+every `set_classes` call fails with `ModuleNotFoundError: No module
+named 'clip'` and Ultralytics' pip AutoInstall fallback cannot repair
+itself inside the slim image.
 
 ### 2. Integration (HACS)
 
@@ -298,6 +308,11 @@ curl http://homeassistant.local:8000/api/health
   downloaded once into `/data` (3 attempts, size + format verified). Set
   the `FRIDGE_VISION_WEIGHTS_URL` environment variable to fetch from a
   mirror, or drop the `.pt` file into the add-on's data directory manually.
+- **CLIP text encoder** — `set_classes` needs CLIP ViT-B/32 (~354 MB).
+  The add-on pre-downloads it at startup into `/data/weights/clip`
+  (persistent; `YOLO_CONFIG_DIR` pins the Ultralytics settings there
+  too). Offline installs log a warning and fetch the encoder on the
+  first re-parameterization instead.
 - **Frames dropped** — snapshot failures are logged at debug level and
   skipped; the analysis simply uses the frames it got (min. 2 required).
 

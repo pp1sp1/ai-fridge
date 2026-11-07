@@ -6,7 +6,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     OMP_NUM_THREADS=2 \
-    MKL_NUM_THREADS=2
+    MKL_NUM_THREADS=2 \
+    YOLO_CONFIG_DIR=/data/ultralytics-config
 
 # Runtime libraries required by the opencv and torch wheels in a slim image.
 RUN apt-get update \
@@ -28,7 +29,19 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir \
         torch==2.6.0 torchvision==0.21.0 \
         --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir \
+        "https://github.com/ultralytics/CLIP/archive/refs/heads/master.zip"
+
+# The `clip` module above is the CLIP fork Ultralytics expects for
+# YOLO-World zero-shot re-parameterization (set_classes -> CLIP text
+# encoder). It is installed from a GitHub zip archive, which pip fetches
+# over plain HTTPS -- no `git` binary is needed in the image. Without it
+# every set_classes call dies with `ModuleNotFoundError: No module named
+# 'clip'` and Ultralytics' pip AutoInstall fallback cannot help either
+# (it shells out to `git clone`, which fails in this slim image).
+# torch/torchvision are already installed at this point, so the CLIP
+# fork's unpinned torch requirement resolves to the existing CPU build.
 
 COPY app/ ./app/
 

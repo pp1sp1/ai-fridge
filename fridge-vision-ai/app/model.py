@@ -192,6 +192,50 @@ def _ensure_weights_file(model_name: str, target: Path) -> Path:
     return target
 
 
+# The CLIP ViT-B/32 text encoder weights Ultralytics downloads for
+# YOLO-World re-parameterization (~354 MB, cached under
+# ``<WEIGHTS_DIR>/clip``); ``ViT-B/32`` is the model YOLO-World uses.
+_CLIP_MODEL_NAME = "ViT-B/32"
+_CLIP_CACHE_FILENAME = "ViT-B-32.pt"
+_CLIP_CACHE_SUBDIR = "clip"
+
+
+def _warm_clip_text_encoder() -> None:
+    """Pre-download the CLIP text encoder used by ``set_classes``.
+
+    Ultralytics fetches CLIP ViT-B/32 lazily on the first zero-shot
+    re-parameterization, which otherwise turns the very first
+    ``add_item``/``reparameterize_model`` call into a multi-minute
+    request (or an HTTP 500 when offline). Warming at startup moves the
+    download to a logged, retried-by-nothing-but-visible step and fails
+    soft: any problem here is a warning, never a startup error.
+    """
+    try:
+        import clip  # packaged in the add-on image (Ultralytics CLIP fork)
+        from ultralytics.utils import WEIGHTS_DIR
+
+        target = Path(WEIGHTS_DIR) / _CLIP_CACHE_SUBDIR
+        marker = target / _CLIP_CACHE_FILENAME
+        if marker.is_file() and marker.stat().st_size > _MIN_VALID_WEIGHTS_BYTES:
+            LOGGER.info("CLIP text encoder already cached at %s", marker)
+            return
+        LOGGER.info(
+            "Pre-downloading the CLIP %s text encoder (~354 MB) into %s; "
+            "this happens once per installation",
+            _CLIP_MODEL_NAME,
+            target,
+        )
+        clip.load(_CLIP_MODEL_NAME, device=DEVICE, download_root=str(target))
+        LOGGER.info("CLIP text encoder cached at %s", marker)
+    except Exception as err:  # noqa: BLE001 - warming is strictly best-effort
+        LOGGER.warning(
+            "CLIP text encoder pre-download skipped: %s. The encoder will be "
+            "downloaded on the first re-parameterization instead; if the "
+            "'clip' package is missing, set_classes calls will fail.",
+            err,
+        )
+
+
 @dataclass(slots=True, frozen=True)
 class RawBox:
     """A single raw detection returned by the model."""
@@ -288,6 +332,10 @@ class VisionModel:
             except ImportError:  # pragma: no cover - torch is always installed
                 pass
             LOGGER.info("Model %s loaded on %s", self._model_name, DEVICE)
+
+            # Zero-shot prompts need the CLIP text encoder; fetch it now so
+            # the first re-parameterization is instant (best-effort).
+            _warm_clip_text_encoder()
 
     def set_classes(self, classes: Sequence[str]) -> tuple[str, ...]:
         """Re-parameterize the detection head with zero-shot text prompts."""
