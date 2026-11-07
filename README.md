@@ -85,6 +85,17 @@ Options (add-on page → Configuration):
 The API is exposed on port 8000 and health-checked by the Supervisor
 watchdog (`/api/health`).
 
+**Updating the add-on.** The Supervisor rebuilds a locally installed
+add-on only when its `version` changes — editing `app/` alone leaves the
+old container running. After pulling new code, open the add-on page and
+click **Update** (or **⋮ → Rebuild**). Since 1.1.0 `model` accepts only
+`yolov8s-worldv2.pt` / `yolov8m-worldv2.pt` (YOLO-World has no nano
+variant; a pre-1.1.0 default of `yolov8n-worldv2.pt` would always crash
+startup). If the Supervisor reports incompatible/invalid configuration
+after the update, open the add-on **Configuration** tab, set *Model* to
+`yolov8s-worldv2.pt` and save — the app itself also falls back to the
+`s` model with a log warning if it ever receives an unsupported name.
+
 ### 2. Integration (HACS)
 
 1. HACS → **⋮ → Custom repositories** → add this repo with category
