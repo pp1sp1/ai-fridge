@@ -411,6 +411,18 @@ curl http://homeassistant.local:8000/api/health
   CPUs, VMs) lacks NNPACK support. PyTorch silently falls back to its
   standard oneDNN kernels, which are at least as fast on modern x86.
   No effect on detection quality; no configuration needed.
+- **`NotImplementedError` from `helpers/storage.py` during entry setup**
+  — happened on the first start after upgrading to 1.4.0: the file
+  `.storage/fridge_vision_inventory_data` on disk was written by
+  integration ≤ 1.3.x with Store version 1, while 1.4.0 declared version
+  2 but did not pass a migration callback, so HA's default migration
+  raised `NotImplementedError` and the config entry failed to set up.
+  Fixed in 1.4.1: a pass-through `async_migrate_func` was added (the
+  v1 → v2 payload conversion happens in `InventoryState.from_storage`)
+  and the legacy payload is written back once in the v2 layout
+  ("Migrated inventory storage to v2: N item(s)" in the log). Existing
+  items are preserved — no data was lost by 1.4.0, the entry simply did
+  not start.
 
 ## Requirements
 

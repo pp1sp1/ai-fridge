@@ -94,26 +94,66 @@ from .inventory import (
 _LOGGER = logging.getLogger(__name__)
 
 
-# Historic v1 storage kept only these fields per item; inventory.py
-# migrates such payloads automatically (missing fields default to "").
+async def _async_migrate_inventory_data(
+    old_version: int, old_minor_version: int, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Migrate a stored inventory payload to ``STORAGE_VERSION`` (v2).
+
+    The payload layout itself needs no conversion: version 1 (written by
+    integration <= 1.3.x) kept only ``{"items": {...}}`` and
+    ``InventoryState.from_storage`` fills in everything added in v2
+    (unit/category/... fields default to "", history starts empty), so
+    the data passes through unchanged and HA re-stores it under the new
+    version on the next save.
+
+    This callback is mandatory: HA's Store calls it whenever the version
+    on disk differs from ``STORAGE_VERSION``, and without it the default
+    migration raises ``NotImplementedError`` — which failed the whole
+    config entry setup on the first start after upgrading (data written
+    by <= 1.3.x, loaded by 1.4.0).
+    """
+    return data
 
 
 class InventoryStore:
     """Store-backed persistence for the inventory state (items + history)."""
 
     def __init__(self, hass: HomeAssistant) -> None:
-        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._store = Store(
+            hass,
+            STORAGE_VERSION,
+            STORAGE_KEY,
+            async_migrate_func=_async_migrate_inventory_data,
+        )
 
     async def async_load(self) -> InventoryState:
         """Load items and change history (tolerant of the v1 layout)."""
         raw = await self._store.async_load()
-        state = InventoryState.from_storage(raw)
         if raw is not None and not isinstance(raw, dict):
             _LOGGER.warning(
                 "Inventory storage payload has unexpected type %s; "
                 "starting with an empty inventory",
                 type(raw).__name__,
             )
+            return InventoryState()
+        state = InventoryState.from_storage(raw)
+        if isinstance(raw, dict) and "items" in raw and "history" not in raw:
+            # Payload written by integration <= 1.3.x (Store version 1):
+            # persist it once in the v2 layout so the migration pass does
+            # not run on every restart.
+            _LOGGER.info(
+                "Migrated inventory storage to v2: %d item(s), "
+                "change history starts empty",
+                len(state.items),
+            )
+            try:
+                await self._store.async_save(state.to_storage())
+            except OSError as err:
+                _LOGGER.warning(
+                    "Could not write the migrated inventory yet (%s); "
+                    "it will be saved on the next change or shutdown",
+                    err,
+                )
         return state
 
     def async_delay_save(self, state: InventoryState) -> None:
