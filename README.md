@@ -128,6 +128,10 @@ image_entity: image.fridge_last_detection
 The card mirrors the `simple-inventory-card` UX (without the barcode
 scanner — products are identified by their AI prompt instead):
 
+- **Visual editor (GUI only, no YAML)**: the card ships its own editor —
+  add it via **+ Dodaj kartę → Fridge Inventory Card** and set the title,
+  image entity (with `image.*` suggestions) and section toggles in the
+  UI; Home Assistant stores the config for you.
 - **Rows with + / −** call `fridge_vision_inventory.update_quantity`
   (delta ±1); quantities update optimistically and then in real time via
   the `fridge_vision_inventory/subscribe_items` WebSocket push (60 s

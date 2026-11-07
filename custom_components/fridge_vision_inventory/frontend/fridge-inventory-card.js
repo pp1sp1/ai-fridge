@@ -15,9 +15,11 @@
  * collapsible "last detection" panel with the annotated frame.
  *
  * The card is auto-injected by the integration (no Lovelace resource
- * setup needed).
+ * setup needed) and ships with its own visual editor, so it can be added
+ * and configured entirely from the Home Assistant UI — no YAML editing
+ * required.
  */
-const CARD_VERSION = "2.0.1";
+const CARD_VERSION = "2.1.0";
 const SERVICE_DOMAIN = "fridge_vision_inventory";
 const WS_ITEMS_TYPE = "fridge_vision_inventory/items";
 const WS_SUBSCRIBE_TYPE = "fridge_vision_inventory/subscribe_items";
@@ -43,6 +45,42 @@ const esc = (value) =>
     '"': "&quot;",
     "'": "&#39;",
   })[ch]);
+
+const CARD_DEFAULT_TITLE = "Zapasy w lodówce";
+const CARD_DEFAULT_IMAGE_ENTITY = "image.fridge_last_detection";
+const CARD_TYPE = "fridge-inventory-card";
+
+// Toggles exposed in the visual editor (all default to true).
+const CARD_TOGGLE_FIELDS = [
+  ["show_header", "Pokaż nagłówek z licznikami"],
+  ["show_search", "Pokaż wyszukiwanie"],
+  ["show_sort", "Pokaż sortowanie"],
+  ["show_filters", "Pokaż filtry"],
+  ["show_add_button", "Pokaż przycisk „+ Dodaj”"],
+  ["show_detection", "Pokaż panel „Ostatnie wykrycie”"],
+];
+
+function normalizeCardConfig(config) {
+  const source = config && typeof config === "object" ? config : {};
+  const normalized = {
+    type:
+      typeof source.type === "string" && source.type
+        ? source.type
+        : `custom:${CARD_TYPE}`,
+    title:
+      typeof source.title === "string" && source.title.length
+        ? source.title
+        : CARD_DEFAULT_TITLE,
+    image_entity:
+      typeof source.image_entity === "string" && source.image_entity
+        ? source.image_entity
+        : CARD_DEFAULT_IMAGE_ENTITY,
+  };
+  for (const [field] of CARD_TOGGLE_FIELDS) {
+    normalized[field] = source[field] !== false;
+  }
+  return normalized;
+}
 
 const ICONS = {
   search:
@@ -105,22 +143,7 @@ class FridgeInventoryCard extends HTMLElement {
     if (!config || typeof config !== "object") {
       throw new Error("Invalid configuration for fridge-inventory-card");
     }
-    this._config = {
-      title:
-        typeof config.title === "string" && config.title.length
-          ? config.title
-          : "Zapasy w lodówce",
-      image_entity:
-        typeof config.image_entity === "string" && config.image_entity
-          ? config.image_entity
-          : "image.fridge_last_detection",
-      show_header: config.show_header !== false,
-      show_search: config.show_search !== false,
-      show_sort: config.show_sort !== false,
-      show_filters: config.show_filters !== false,
-      show_add_button: config.show_add_button !== false,
-      show_detection: config.show_detection !== false,
-    };
+    this._config = normalizeCardConfig(config);
     if (this._initialized) {
       this._initialized = false;
       this.shadowRoot.innerHTML = "";
@@ -163,9 +186,14 @@ class FridgeInventoryCard extends HTMLElement {
 
   static getStubConfig() {
     return {
-      title: "Zapasy w lodówce",
-      image_entity: "image.fridge_last_detection",
+      title: CARD_DEFAULT_TITLE,
+      image_entity: CARD_DEFAULT_IMAGE_ENTITY,
     };
+  }
+
+  // Lets Home Assistant open the built-in visual editor (pure GUI, no YAML).
+  static async getConfigElement() {
+    return document.createElement("fridge-inventory-card-editor");
   }
 
   // ---------- UI state persistence ----------
@@ -1265,6 +1293,137 @@ if (!window.customCards.some((card) => card.type === "fridge-inventory-card")) {
 
 if (!customElements.get("fridge-inventory-card")) {
   customElements.define("fridge-inventory-card", FridgeInventoryCard);
+}
+
+// ---------- Visual editor (full GUI configuration, no YAML needed) ----------
+
+class FridgeInventoryCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._config = null;
+    this._ready = false;
+  }
+
+  setConfig(config) {
+    this._config = normalizeCardConfig(config);
+    if (this._ready) this._syncInputs();
+    else this._render();
+  }
+
+  _emitConfig() {
+    this.dispatchEvent(
+      new CustomEvent("config-changed", {
+        detail: { config: { ...this._config } },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  _imageEntityOptions() {
+    try {
+      const homeAssistant = document.querySelector("home-assistant");
+      const hass = homeAssistant && homeAssistant.hass;
+      if (!hass || !hass.states) return [];
+      return Object.keys(hass.states)
+        .filter((entityId) => entityId.startsWith("image."))
+        .sort();
+    } catch (err) {
+      return [];
+    }
+  }
+
+  _render() {
+    const entities = this._imageEntityOptions();
+    const style = `
+      :host { display: block; }
+      .editor { display: flex; flex-direction: column; gap: 14px; }
+      .field { display: flex; flex-direction: column; gap: 5px; }
+      .field-title, .field > span { font-size: 0.8rem; font-weight: 600; color: var(--primary-text-color, #212121); }
+      .field-title { display: block; margin-bottom: 7px; }
+      .field > small { font-size: 0.72rem; line-height: 1.4; color: var(--secondary-text-color, #727272); }
+      input[type="text"] {
+        padding: 8px 10px; border-radius: 8px; font-size: 0.95rem; font-family: inherit;
+        border: 1px solid var(--divider-color, #e0e0e0);
+        background: var(--card-background-color, #fff);
+        color: var(--primary-text-color, #212121);
+      }
+      .toggles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px 16px; }
+      .check { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; cursor: pointer; color: var(--primary-text-color, #212121); }
+      .check input { accent-color: var(--primary-color, #03a9f4); }
+    `;
+    const toggles = CARD_TOGGLE_FIELDS.map(
+      ([field, label]) =>
+        `<label class="check"><input type="checkbox" id="${field}" /> ${label}</label>`
+    ).join("");
+    this.shadowRoot.innerHTML = `
+      <style>${style}</style>
+      <div class="editor">
+        <div class="field">
+          <span>Tytuł karty</span>
+          <input id="title" type="text" />
+          <small>Np. „Zapasy w lodówce” — widoczny w nagłówku karty.</small>
+        </div>
+        <div class="field">
+          <span>Encja obrazu z ostatnim wykryciem</span>
+          <input id="image_entity" type="text" list="fviEntityList" />
+          <small>Domyślnie image.fridge_last_detection — encje image.* są podpowiadane.</small>
+          <datalist id="fviEntityList">
+            ${entities
+              .map((entityId) => `<option value="${esc(entityId)}"></option>`)
+              .join("")}
+          </datalist>
+        </div>
+        <div>
+          <span class="field-title">Sekcje karty</span>
+          <div class="toggles">${toggles}</div>
+        </div>
+      </div>
+    `;
+    const byId = (id) => this.shadowRoot.getElementById(id);
+    byId("title").addEventListener("input", () => {
+      this._config.title = byId("title").value;
+      this._emitConfig();
+    });
+    byId("image_entity").addEventListener("input", () => {
+      this._config.image_entity = byId("image_entity").value.trim();
+      this._emitConfig();
+    });
+    for (const [field] of CARD_TOGGLE_FIELDS) {
+      byId(field).addEventListener("change", () => {
+        this._config[field] = byId(field).checked;
+        this._emitConfig();
+      });
+    }
+    this._ready = true;
+    this._syncInputs();
+  }
+
+  _syncInputs() {
+    const byId = (id) => this.shadowRoot.getElementById(id);
+    const title = byId("title");
+    if (title && title.value !== this._config.title) title.value = this._config.title;
+    const imageEntity = byId("image_entity");
+    if (imageEntity && imageEntity.value !== this._config.image_entity) {
+      imageEntity.value = this._config.image_entity;
+    }
+    const datalist = byId("fviEntityList");
+    if (datalist) {
+      const entities = this._imageEntityOptions();
+      datalist.innerHTML = entities
+        .map((entityId) => `<option value="${esc(entityId)}"></option>`)
+        .join("");
+    }
+    for (const [field] of CARD_TOGGLE_FIELDS) {
+      const box = byId(field);
+      if (box) box.checked = Boolean(this._config[field]);
+    }
+  }
+}
+
+if (!customElements.get("fridge-inventory-card-editor")) {
+  customElements.define("fridge-inventory-card-editor", FridgeInventoryCardEditor);
 }
 
 console.info(
