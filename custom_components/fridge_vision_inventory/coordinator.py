@@ -103,28 +103,56 @@ async def _async_migrate_inventory_data(
     integration <= 1.3.x) kept only ``{"items": {...}}`` and
     ``InventoryState.from_storage`` fills in everything added in v2
     (unit/category/... fields default to "", history starts empty), so
-    the data passes through unchanged and HA re-stores it under the new
-    version on the next save.
-
-    This callback is mandatory: HA's Store calls it whenever the version
-    on disk differs from ``STORAGE_VERSION``, and without it the default
-    migration raises ``NotImplementedError`` — which failed the whole
-    config entry setup on the first start after upgrading (data written
-    by <= 1.3.x, loaded by 1.4.0).
+    the data passes through unchanged. HA re-stores the payload under
+    the new version right after the migration returns.
     """
     return data
+
+
+class _MigratingStore(Store):
+    """Store that provides the migration hook the way HA actually wants it.
+
+    HA invokes ``await self._async_migrate_func(...)`` whenever the
+    version stored on disk differs from ``STORAGE_VERSION``; the base
+    implementation just raises ``NotImplementedError``, which failed the
+    whole config entry setup when it found data written by integration
+    <= 1.3.x (bug in 1.4.0). There is no constructor argument for the
+    hook either — passing one crashes setup with ``TypeError:
+    Store.__init__() got an unexpected keyword argument
+    'async_migrate_func'`` (bug in 1.4.1). The supported way is to
+    subclass Store and override the method: HA decides the call form by
+    counting the override's parameters — exactly two parameters get
+    ``(old_version, old_data)``, any other count gets
+    ``(old_version, old_minor_version, old_data)`` — and older releases
+    also invoke the hook under its public name ``async_migrate_func``.
+    The override below tolerates all of those call forms.
+    """
+
+    async def _async_migrate_func(
+        self,
+        old_version: int,
+        old_minor_version: int | dict[str, Any],
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Pass the stored payload through (see ``_async_migrate_inventory_data``)."""
+        if data is None:
+            # Defensive: a two-argument call passes (old_version, old_data).
+            data = old_minor_version  # type: ignore[assignment]
+            old_minor_version = 0
+        return await _async_migrate_inventory_data(
+            old_version, old_minor_version, data
+        )
+
+    # Same hook under the public name used by older HA releases.
+    async def async_migrate_func(self, *args: Any) -> dict[str, Any]:
+        return await self._async_migrate_func(*args)
 
 
 class InventoryStore:
     """Store-backed persistence for the inventory state (items + history)."""
 
     def __init__(self, hass: HomeAssistant) -> None:
-        self._store = Store(
-            hass,
-            STORAGE_VERSION,
-            STORAGE_KEY,
-            async_migrate_func=_async_migrate_inventory_data,
-        )
+        self._store = _MigratingStore(hass, STORAGE_VERSION, STORAGE_KEY)
 
     async def async_load(self) -> InventoryState:
         """Load items and change history (tolerant of the v1 layout)."""
