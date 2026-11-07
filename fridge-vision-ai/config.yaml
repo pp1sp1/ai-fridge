@@ -20,10 +20,10 @@ auth_api: false
 ingress: false
 host_network: false
 options:
-  model: yolov8n-worldv2.pt
+  model: yolov8s-worldv2.pt
   image_size: 640
   log_level: info
 schema:
-  model: list(yolov8n-worldv2.pt|yolov8s-worldv2.pt)
+  model: list(yolov8s-worldv2.pt|yolov8m-worldv2.pt)
   image_size: int(320,1280)
   log_level: list(trace|debug|info|warning|error|fatal)

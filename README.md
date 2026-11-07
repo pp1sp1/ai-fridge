@@ -66,15 +66,18 @@ services are involved.
 1. Settings → Add-ons → Add-on Store → **⋮ → Repositories** and add this
    repository URL (or place the folder in `/addons/local/`).
 2. Install **Fridge Vision AI**, then start it.
-3. First start downloads the YOLO-World weights into the persistent
-   `/data` volume (~25 MB for `yolov8n-worldv2.pt`, ~90 MB for the `s`
-   model) — internet access is required once.
+3. Both supported YOLO-World weights are baked into the image at build time
+   (`/opt/weights`), so first start normally needs no internet. If the
+   build host was offline the service downloads the selected model on
+   first start into the persistent `/data` volume (~26 MB for
+   `yolov8s-worldv2.pt`, ~57 MB for `yolov8m-worldv2.pt`) — internet
+   access is required once in that case.
 
 Options (add-on page → Configuration):
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `model` | `yolov8n-worldv2.pt` | Alternative: `yolov8s-worldv2.pt` (more accurate, ~600 MB RAM budget) |
+| `model` | `yolov8s-worldv2.pt` | Alternative: `yolov8m-worldv2.pt` (more accurate, more RAM/slower on CPU). Note: YOLO-World has no nano variant |
 | `image_size` | `640` | Inference resolution (320–1280). Lower = faster, less RAM |
 | `log_level` | `info` | Log verbosity |
 
@@ -234,9 +237,12 @@ curl http://homeassistant.local:8000/api/health
   calls, lower the camera FPS jitter, or use a more distinctive prompt.
 - **Door sensor semantics** — the integration assumes `on` = open. If
   your contact sensor is inverted, wrap it in a template binary sensor.
-- **Memory** — the `n` model at 640 px stays well under the ~600 MB
-  budget; the `s` model or larger `image_size` increases RAM use.
-- **First start is slow** — weights are downloaded once into `/data`.
+- **Memory** — the `s` model at 640 px stays within the ~600 MB budget;
+  the `m` model or a larger `image_size` increases RAM use.
+- **First start** — weights ship baked in the image; when absent they are
+  downloaded once into `/data` (3 attempts, size + format verified). Set
+  the `FRIDGE_VISION_WEIGHTS_URL` environment variable to fetch from a
+  mirror, or drop the `.pt` file into the add-on's data directory manually.
 - **Frames dropped** — snapshot failures are logged at debug level and
   skipped; the analysis simply uses the frames it got (min. 2 required).
 
